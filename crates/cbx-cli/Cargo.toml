@@ -1,0 +1,22 @@
+[package]
+name = "cbx-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Self-test suite and CLI thumbnail extractor for cbxshell-rs"
+
+[[bin]]
+name = "cbx-cli"
+path = "src/main.rs"
+
+[dependencies]
+cbx-core = { path = "../cbx-core" }
+image.workspace = true
+image-webp.workspace = true
+jxl-oxide.workspace = true
+zip.workspace = true
+sevenz-rust2.workspace = true
+rar-codec.workspace = true
+tar.workspace = true
+windows.workspace = true
+windows-core.workspace = true

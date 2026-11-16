@@ -1,0 +1,15 @@
+[package]
+name = "cbx-installer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Standalone Windows 10/11 GUI & silent installer/uninstaller for CBX Shell"
+
+[dependencies]
+cbx-core = { path = "../cbx-core" }
+zip.workspace = true
+windows.workspace = true
+windows-core.workspace = true
+
+[build-dependencies]
+zip.workspace = true

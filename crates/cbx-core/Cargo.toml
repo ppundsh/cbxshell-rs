@@ -1,0 +1,19 @@
+[package]
+name = "cbx-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Core archive cover discovery, EPUB OPF parser, WebP/image thumbnailer, and registry management for cbxshell-rs"
+
+[dependencies]
+image.workspace = true
+image-webp.workspace = true
+jxl-oxide.workspace = true
+zip.workspace = true
+sevenz-rust2.workspace = true
+rar-codec.workspace = true
+tar = "0.4"
+quick-xml = "0.37"
+everything-ipc = { version = "0.1.4", default-features = false }
+windows.workspace = true
+windows-core.workspace = true

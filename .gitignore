@@ -1,0 +1,13 @@
+/target/
+/dist/
+*.pdb
+*.ilk
+*.old
+*.log
+*.tmp
+.DS_Store
+Thumbs.db
+# Local maintenance helpers
+/run-checks.cmd
+/purge-history.cmd
+/purge-history.ps1
