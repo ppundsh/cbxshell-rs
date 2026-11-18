@@ -176,7 +176,7 @@ dependencies = [
 
 [[package]]
 name = "cbx-cli"
-version = "2.0.1"
+version = "2.0.2"
 dependencies = [
  "cbx-core",
  "image",
@@ -192,7 +192,7 @@ dependencies = [
 
 [[package]]
 name = "cbx-core"
-version = "2.0.1"
+version = "2.0.2"
 dependencies = [
  "everything-ipc",
  "image",
@@ -209,7 +209,7 @@ dependencies = [
 
 [[package]]
 name = "cbx-installer"
-version = "2.0.1"
+version = "2.0.2"
 dependencies = [
  "cbx-core",
  "windows 0.58.0",
@@ -219,7 +219,7 @@ dependencies = [
 
 [[package]]
 name = "cbx-manager"
-version = "2.0.1"
+version = "2.0.2"
 dependencies = [
  "cbx-core",
  "ed25519-compact",
@@ -230,7 +230,7 @@ dependencies = [
 
 [[package]]
 name = "cbxshell"
-version = "2.0.1"
+version = "2.0.2"
 dependencies = [
  "cbx-core",
  "windows 0.58.0",
