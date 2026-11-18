@@ -47,6 +47,8 @@ A thumbnail never needs the whole archive. Each format reads only what is requir
 | **7z / CB7** | Signature header (32 B) → end header → the cover's data block | Headers sit at the end; blocks are decoded in order, and a solid block must be decoded from its start (bounded by the 128 MiB drain cap and the deadline). |
 | **TAR / CBT** | 512-byte headers one by one (data skipped with seeks) → cover entry | The first pass walks headers only and records each candidate's data position; the chosen entry is then read directly. |
 
+**Archive time budget**: set on the Archives tab (default 30 s, 5–120 s). It bounds both the cover scan and the whole thumbnail request the extension handles for an archive (plus 5 s for decoding and scaling); other formats such as video keep the Video tab's "Single-File Time Budget".
+
 When the RAR fast path meets an unusual layout (encrypted headers, a non-standard SFX) or the decoder rejects the minimal archive, it falls back to the previous "read a 16–96 MiB prefix and parse it" path, so compatibility is unchanged.
 
 > Random access is still required: ZIP and 7z keep their directory at the end, so the reader must be able to seek there; RAR and TAR headers are spread across the file. If a file is still downloading or being copied and does not yet contain the cover, thumbnail extraction fails; it succeeds once the file is complete.

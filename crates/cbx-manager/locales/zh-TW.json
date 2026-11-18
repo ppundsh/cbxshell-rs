@@ -57,7 +57,7 @@
   "report.status_timeout": "⚠️ 逾時跳過",
   "report.status_failed": "✗ 處理中斷或失敗",
 
-  "experiment.title": "拖放檔案實驗區",
+  "experiment.title": "拖放實驗與縮圖產生",
   "experiment.hint": "將影片、音訊或壓縮檔直接拖放到此視窗，即時探測影格並顯示各項指標與預覽圖",
   "experiment.waiting": "〔等待拖入檔案中...〕",
   "experiment.preview_box": "縮圖預覽窗格",

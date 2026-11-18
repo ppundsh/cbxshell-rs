@@ -42,6 +42,14 @@ $ErrorActionPreference = 'Continue'
 $Root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 $Namespace = 'cbxshell-release'
 $Asset = 'CBXShell-Setup.exe'
+# Project-specific values (shared release standard): release.config.psd1 at the repo root.
+$cfgPath = Join-Path $Root 'release.config.psd1'
+if (Test-Path -LiteralPath $cfgPath) {
+    $cfg = Import-PowerShellDataFile -LiteralPath $cfgPath
+    if ($cfg.Repo -and -not $PSBoundParameters.ContainsKey('Repo')) { $Repo = $cfg.Repo }
+    if ($cfg.Asset) { $Asset = $cfg.Asset }
+    if ($cfg.ApprovalNamespace) { $Namespace = $cfg.ApprovalNamespace }
+}
 
 function Fail([string]$msg) {
     Write-Host "`n[錯誤] $msg" -ForegroundColor Red

@@ -69,6 +69,17 @@ pub struct PrewarmProgress {
     pub elapsed_ms: AtomicUsize,
     pub current: Mutex<String>,
     pub root: Mutex<String>,
+    /// Files whose thumbnail could not be produced in the last run (for "retry failed").
+    pub failed_paths: Mutex<Vec<PathBuf>>,
+}
+
+/// What a run works on.
+#[derive(Clone, Debug)]
+pub enum PrewarmTarget {
+    /// A folder and up to `max_depth` levels of sub-folders (associated extensions only).
+    Folder(PathBuf),
+    /// An explicit list of files, e.g. the failures of an earlier run or of the activity log.
+    Files(Vec<PathBuf>),
 }
 
 impl PrewarmProgress {
@@ -147,7 +158,7 @@ fn wide(s: &str) -> Vec<u16> {
 }
 
 /// Starts a pre-warm run on background threads and returns immediately.
-pub fn start(root: PathBuf, opts: PrewarmOptions, progress: Arc<PrewarmProgress>) {
+pub fn start(target: PrewarmTarget, opts: PrewarmOptions, progress: Arc<PrewarmProgress>) {
     progress.cancel.store(false, Ordering::Release);
     progress.total.store(0, Ordering::Release);
     progress.done.store(0, Ordering::Release);
@@ -155,8 +166,14 @@ pub fn start(root: PathBuf, opts: PrewarmOptions, progress: Arc<PrewarmProgress>
     progress.cached.store(0, Ordering::Release);
     progress.failed.store(0, Ordering::Release);
     progress.elapsed_ms.store(0, Ordering::Release);
+    if let Ok(mut f) = progress.failed_paths.lock() {
+        f.clear();
+    }
     if let Ok(mut r) = progress.root.lock() {
-        *r = root.to_string_lossy().into_owned();
+        *r = match &target {
+            PrewarmTarget::Folder(root) => root.to_string_lossy().into_owned(),
+            PrewarmTarget::Files(files) => format!("{} files", files.len()),
+        };
     }
     progress.scanning.store(true, Ordering::Release);
 
@@ -165,7 +182,7 @@ pub fn start(root: PathBuf, opts: PrewarmOptions, progress: Arc<PrewarmProgress>
         // Only extensions Explorer actually routes to CBX Shell; anything else would be
         // answered by another handler and is not ours to warm.
         let mut assoc: HashMap<String, bool> = HashMap::new();
-        let targets = collect_targets(&root, opts.max_depth, &progress.cancel, |ext| {
+        let mut wanted = |ext: &str| {
             if ext.is_empty() {
                 return false;
             }
@@ -173,7 +190,22 @@ pub fn start(root: PathBuf, opts: PrewarmOptions, progress: Arc<PrewarmProgress>
                 crate::registry::is_associated(HKEY_CURRENT_USER, ext)
                     || crate::registry::is_associated(HKEY_LOCAL_MACHINE, ext)
             })
-        });
+        };
+        let (targets, notify_dirs): (Vec<PathBuf>, Vec<PathBuf>) = match &target {
+            PrewarmTarget::Folder(root) => (collect_targets(root, opts.max_depth, &progress.cancel, &mut wanted), vec![root.clone()]),
+            PrewarmTarget::Files(files) => {
+                let mut list: Vec<PathBuf> = Vec::new();
+                for f in files.iter().take(MAX_PREWARM_FILES) {
+                    if f.is_file() && wanted(&ext_of(f)) && !list.contains(f) {
+                        list.push(f.clone());
+                    }
+                }
+                let mut dirs: Vec<PathBuf> = list.iter().filter_map(|f| f.parent().map(PathBuf::from)).collect();
+                dirs.sort();
+                dirs.dedup();
+                (list, dirs)
+            }
+        };
         progress.total.store(targets.len(), Ordering::Release);
         progress.running.store(true, Ordering::Release);
         progress.scanning.store(false, Ordering::Release);
@@ -193,11 +225,13 @@ pub fn start(root: PathBuf, opts: PrewarmOptions, progress: Arc<PrewarmProgress>
             let _ = h.join();
         }
 
-        // Let open windows of that folder pick the new thumbnails up.
-        let root_w = wide(&root.to_string_lossy());
-        // SAFETY: NUL-terminated path buffer that outlives the call.
-        unsafe {
-            SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_PATHW | SHCNF_FLUSHNOWAIT, Some(root_w.as_ptr().cast()), None);
+        // Let open windows of those folders pick the new thumbnails up.
+        for dir in notify_dirs.iter().take(256) {
+            let dir_w = wide(&dir.to_string_lossy());
+            // SAFETY: NUL-terminated path buffer that outlives the call.
+            unsafe {
+                SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_PATHW | SHCNF_FLUSHNOWAIT, Some(dir_w.as_ptr().cast()), None);
+            }
         }
         progress
             .elapsed_ms
@@ -259,6 +293,9 @@ fn worker(targets: &[PathBuf], next: &AtomicUsize, progress: &PrewarmProgress, o
             };
             if !ok {
                 progress.failed.fetch_add(1, Ordering::AcqRel);
+                if let Ok(mut f) = progress.failed_paths.lock() {
+                    f.push(path.clone());
+                }
             }
             progress.done.fetch_add(1, Ordering::AcqRel);
         }

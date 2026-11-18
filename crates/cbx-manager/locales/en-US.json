@@ -57,7 +57,7 @@
   "report.status_timeout": "⚠️ Timeout Skipped",
   "report.status_failed": "✗ Interrupted or Failed",
 
-  "experiment.title": "Drag & Drop Experiment Area",
+  "experiment.title": "Drop Zone: Probe & Pre-generate",
   "experiment.hint": "Drag any media or archive file here to inspect smart rendering metrics and preview live",
   "experiment.waiting": "[ Waiting for dragged file... ]",
   "experiment.preview_box": "Thumbnail Preview",

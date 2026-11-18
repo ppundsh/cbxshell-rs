@@ -525,7 +525,13 @@ impl IThumbnailProvider_Impl for CbxShellProvider_Impl {
             let _ = tx.send(res);
         });
 
-        let timeout_sec = settings.watchdog_timeout_sec.clamp(3, 60);
+        // Archives have their own budget (Archives tab); the extra seconds cover decoding and
+        // scaling the cover after the scan deadline.
+        let timeout_sec = if cbx_core::media::is_image_archive_extension(&ext_clone) {
+            settings.max_scan_seconds.clamp(5, 120) + 5
+        } else {
+            settings.watchdog_timeout_sec.clamp(3, 60)
+        };
         let watchdog_limit = std::time::Duration::from_secs(timeout_sec as u64);
         match rx.recv_timeout(watchdog_limit) {
             Ok(Ok(Ok(payload))) => {

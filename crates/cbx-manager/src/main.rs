@@ -196,7 +196,8 @@ fn format_activity_log(state: &AppState, snap: &cbx_core::monitor::MonitorSnapsh
 
 /// Export button action: asks for a file and writes the log there (UTF-8 with BOM).
 unsafe fn export_activity_log(hwnd: HWND, state: &mut AppState) {
-    let Some(snap) = cbx_core::monitor::fetch_snapshot() else {
+    store_monitor_snapshot(state, cbx_core::monitor::fetch_snapshot());
+    let Some(snap) = state.monitor_snapshot.clone() else {
         state.cache_status_kind = CacheStatusKind::Custom(format!("✗ {}", tr("目前沒有可匯出的運作紀錄", "No activity log to export")));
         state.cache_status_msg = state.get_cache_status_display();
         return;
@@ -1047,6 +1048,7 @@ enum EditTarget {
     MaxGopHops,
     ConsecutiveLimit,
     WatchdogTimeoutSec,
+    ArchiveTimeoutSec,
     CustomTextExtensions,
 }
 
@@ -1099,6 +1101,7 @@ struct AppState {
     /// Show the pre-generation status instead of the cache status line.
     prewarm_shown: bool,
     prewarm_last_done: usize,
+    prewarm_last_tick: usize,
     prewarm_was_active: bool,
 
     // Pending extension associations
@@ -1155,6 +1158,16 @@ struct AppState {
     drag_resizer_start_h: i32,
 
     about_card1_h: std::cell::Cell<i32>,
+    /// Activity log accumulated by the manager (newest first). The shared-memory monitor keeps
+    /// only the last 64 entries, which a folder pre-generation run overwrites within seconds;
+    /// filtering works on this longer log instead.
+    monitor_log: std::collections::VecDeque<cbx_core::monitor::SnapshotHistoryItem>,
+    /// `total_processed` of the last merged snapshot.
+    monitor_log_total: u64,
+    /// History rows that fit in the monitor (as last painted).
+    monitor_visible_rows: std::cell::Cell<usize>,
+    /// When the current / last folder pre-generation run started (for the ETA).
+    prewarm_started: Option<std::time::Instant>,
     /// Height of the drag & drop experiment card, grown to fit wrapped result text.
     drop_card_h: std::cell::Cell<i32>,
     video_card_tools_h: std::cell::Cell<i32>,
@@ -1301,6 +1314,7 @@ impl AppState {
             prewarm_size: 256,
             prewarm_shown: false,
             prewarm_last_done: 0,
+            prewarm_last_tick: 0,
             prewarm_was_active: false,
             pending_associations: HashMap::new(),
             dragging_slider: None,
@@ -1342,6 +1356,10 @@ impl AppState {
             drag_resizer_start_h: 0,
 
             about_card1_h: std::cell::Cell::new(scale_px(190, dpi)),
+            monitor_log: std::collections::VecDeque::new(),
+            monitor_log_total: 0,
+            monitor_visible_rows: std::cell::Cell::new(6),
+            prewarm_started: None,
             drop_card_h: std::cell::Cell::new(scale_px(175, dpi)),
             video_card_tools_h: std::cell::Cell::new(scale_px(210, dpi)),
             video_everything_btn_rel_y: std::cell::Cell::new(scale_px(120, dpi)),
@@ -1462,6 +1480,10 @@ impl AppState {
     fn switch_tab(&mut self, hwnd: HWND, new_tab: ManagerTab) {
         if self.active_tab == new_tab {
             return;
+        }
+        if self.active_edit == Some(EditTarget::ArchiveTimeoutSec) {
+            // Saved immediately, like the other archive options.
+            unsafe { commit_active_edit(self) };
         }
         if self.active_edit.is_some() || self.has_unapplied_text_edits {
             self.active_edit = None;
@@ -2170,6 +2192,7 @@ unsafe fn commit_active_edit(state: &mut AppState) {
             EditTarget::MaxGopHops => state.settings.max_gop_hops,
             EditTarget::ConsecutiveLimit => state.settings.consecutive_unacceptable_limit,
             EditTarget::WatchdogTimeoutSec => state.settings.watchdog_timeout_sec,
+            EditTarget::ArchiveTimeoutSec => state.settings.max_scan_seconds,
             EditTarget::CustomTextExtensions => 0,
         });
         match target {
@@ -2179,9 +2202,17 @@ unsafe fn commit_active_edit(state: &mut AppState) {
             EditTarget::MaxGopHops => state.settings.max_gop_hops = parsed.clamp(0, 20),
             EditTarget::ConsecutiveLimit => state.settings.consecutive_unacceptable_limit = parsed.clamp(1, 20),
             EditTarget::WatchdogTimeoutSec => state.settings.watchdog_timeout_sec = parsed.clamp(3, 60),
+            EditTarget::ArchiveTimeoutSec => state.settings.max_scan_seconds = parsed.clamp(5, 120),
             EditTarget::CustomTextExtensions => {}
         }
         state.settings.sanitize();
+        if target == EditTarget::ArchiveTimeoutSec {
+            // Archive options apply at once (no Apply button on the Archives tab).
+            let _ = state.settings.save();
+            state.edit_caret_to_end();
+            state.edit_buffer.clear();
+            return;
+        }
         state.edit_caret_to_end();
         state.edit_buffer.clear();
         state.has_unapplied_text_edits = true;
@@ -2305,7 +2336,7 @@ unsafe extern "system" fn wnd_proc(
                         (None, None) => false,
                         _ => true,
                     };
-                    state.monitor_snapshot = snap;
+                    store_monitor_snapshot(state, snap);
                     if changed {
                         let _ = InvalidateRect(hwnd, None, false);
                     }
@@ -3199,7 +3230,7 @@ fn calculate_content_height(state: &AppState) -> i32 {
             let card2_h = scale_px(145, dpi);
             let sort_anim = state.archive_sort_expand_anim;
             let sort_card_h = archive_sort_card_height(dpi, sort_anim);
-            let opt_card_h = scale_px(120, dpi);
+            let opt_card_h = scale_px(154, dpi);
             let header_h = scale_px(64, dpi);
             let extra_h = scale_px(210, dpi);
             let anim_val = state.risk_card_expand_anim;
@@ -3338,7 +3369,7 @@ unsafe fn handle_content_click(hwnd: HWND, state: &mut AppState, x: i32, y: i32)
 
             // Card 4: Remaining Archive Extraction Options (3 toggles)
             let opt_card_y = sort_card_y + sort_card_h + scale_px(14, state.dpi);
-            let opt_card_h = scale_px(120, state.dpi);
+            let opt_card_h = scale_px(154, state.dpi);
             let row_h = scale_px(34, state.dpi);
             let switch_w = scale_px(44, state.dpi);
             let switch_x = content_x + content_w - scale_px(40, state.dpi) - scale_px(52, state.dpi) - scale_px(2, state.dpi);
@@ -3367,6 +3398,52 @@ unsafe fn handle_content_click(hwnd: HWND, state: &mut AppState, x: i32, y: i32)
                     let _ = state.settings.save();
                     trigger_toggle_animation(hwnd, state, 7, state.settings.filter_plain_covers);
                     return;
+                }
+            }
+
+            // Row 3: Archive time budget (number box + − / +), same geometry as draw_row_number_input
+            {
+                let row_y = opt_card_y + scale_px(14, state.dpi) + row_h * 3;
+                let box_w = scale_px(75, state.dpi);
+                let box_h = scale_px(24, state.dpi);
+                let box_x = content_x - scale_px(16, state.dpi) + scale_px(250, state.dpi);
+                let box_y = row_y + scale_px(2, state.dpi);
+                let btn_sz = scale_px(22, state.dpi);
+                let minus_x = box_x + box_w + scale_px(32, state.dpi);
+                let plus_x = minus_x + btn_sz + scale_px(4, state.dpi);
+                let btn_y = box_y + (box_h - btn_sz) / 2;
+                if y >= box_y && y <= box_y + box_h && x >= box_x && x <= box_x + box_w {
+                    if state.active_edit == Some(EditTarget::ArchiveTimeoutSec) {
+                        state.edit_caret_to_end();
+                    } else {
+                        commit_active_edit(state);
+                        state.active_edit = Some(EditTarget::ArchiveTimeoutSec);
+                        state.edit_buffer = state.settings.max_scan_seconds.to_string();
+                        state.edit_select_all_text();
+                    }
+                    let _ = InvalidateRect(hwnd, None, false);
+                    return;
+                }
+                if y >= btn_y && y <= btn_y + btn_sz {
+                    let step: i32 = if x >= minus_x && x <= minus_x + btn_sz {
+                        -1
+                    } else if x >= plus_x && x <= plus_x + btn_sz {
+                        1
+                    } else {
+                        0
+                    };
+                    if step != 0 {
+                        state.trigger_button_anim(hwnd, if step < 0 { 410 } else { 411 }, false);
+                        let v = (state.settings.max_scan_seconds as i32 + step).clamp(5, 120) as u32;
+                        state.settings.max_scan_seconds = v;
+                        if state.active_edit == Some(EditTarget::ArchiveTimeoutSec) {
+                            state.edit_buffer = v.to_string();
+                            state.edit_caret_to_end();
+                        }
+                        let _ = state.settings.save();
+                        let _ = InvalidateRect(hwnd, None, false);
+                        return;
+                    }
                 }
             }
 
@@ -4141,6 +4218,18 @@ unsafe fn handle_content_click(hwnd: HWND, state: &mut AppState, x: i32, y: i32)
                 return;
             }
 
+            // "Retry N failed" after a pre-generation run.
+            if !prewarm_failed_paths(state).is_empty() {
+                let (rx, ry, rw, rh) = prewarm_retry_button_geom(state, content_x, content_w, card1_y);
+                if x >= rx && x <= rx + rw && y >= ry && y <= ry + rh {
+                    state.trigger_button_anim(hwnd, 312, false);
+                    let failed = prewarm_failed_paths(state);
+                    start_prewarm_files(state, failed);
+                    let _ = InvalidateRect(hwnd, None, false);
+                    return;
+                }
+            }
+
             // Thumbnail size used for pre-generation (cycles 96 / 256 / 768).
             let (size_x, size_y, size_w, size_h) = prewarm_size_button_geom(state, content_x, content_w, card1_y);
             if x >= size_x && x <= size_x + size_w && y >= size_y && y <= size_y + size_h {
@@ -4267,6 +4356,8 @@ unsafe fn handle_content_click(hwnd: HWND, state: &mut AppState, x: i32, y: i32)
                 if !state.settings.monitor_enabled {
                     cbx_core::monitor::clear_all_history();
                     state.monitor_snapshot = None;
+                    state.monitor_log.clear();
+                    state.monitor_log_total = 0;
                     state.monitor_scroll = 0;
                 }
                 let _ = InvalidateRect(hwnd, None, false);
@@ -4289,10 +4380,22 @@ unsafe fn handle_content_click(hwnd: HWND, state: &mut AppState, x: i32, y: i32)
             let pipe_dd_w = scale_px(104, state.dpi);
             let exp_w = scale_px(85, state.dpi);
             let exp_x = clr_x - scale_px(6, state.dpi) - exp_w;
-            let status_dd_x = exp_x - scale_px(17, state.dpi) - status_dd_w;
+            let redo_w = scale_px(92, state.dpi);
+            let redo_x = exp_x - scale_px(6, state.dpi) - redo_w;
+            let status_dd_x = redo_x - scale_px(17, state.dpi) - status_dd_w;
             let pipe_dd_x = status_dd_x - dd_gap - pipe_dd_w;
 
             if state.settings.monitor_enabled && state.monitor_expand_anim > 0.8 {
+                if x >= redo_x && x <= redo_x + redo_w && y >= metrics_y && y <= metrics_y + clr_h {
+                    state.trigger_button_anim(hwnd, 307, false);
+                    let failed = failed_log_paths(state);
+                    if start_prewarm_files(state, failed) > 0 {
+                        // Show the run's progress (Advanced › first card and the drop zone).
+                        state.prewarm_shown = true;
+                    }
+                    let _ = InvalidateRect(hwnd, None, false);
+                    return;
+                }
                 if x >= exp_x && x <= exp_x + exp_w && y >= metrics_y && y <= metrics_y + clr_h {
                     state.trigger_button_anim(hwnd, 306, false);
                     export_activity_log(hwnd, state);
@@ -4303,6 +4406,8 @@ unsafe fn handle_content_click(hwnd: HWND, state: &mut AppState, x: i32, y: i32)
                     state.trigger_button_anim(hwnd, 304, false);
                     cbx_core::monitor::clear_all_history();
                     state.monitor_snapshot = None;
+                    state.monitor_log.clear();
+                    state.monitor_log_total = 0;
                     state.monitor_scroll = 0;
                     let _ = InvalidateRect(hwnd, None, false);
                     return;
@@ -4339,7 +4444,7 @@ unsafe fn handle_content_click(hwnd: HWND, state: &mut AppState, x: i32, y: i32)
                         .collect();
 
                     let visible_rows = (((bottom_limit - rows_start_y).max(0) / row_h).max(1) as usize).min(30);
-                    let scroll_offset = state.monitor_scroll.min(filtered_history.len().saturating_sub(1));
+                    let scroll_offset = state.monitor_scroll.min(filtered_history.len().saturating_sub(visible_rows));
 
                     for (idx, item) in filtered_history.iter().skip(scroll_offset).take(visible_rows).enumerate() {
                         let ry = rows_start_y + (idx as i32 * row_h);
@@ -4364,7 +4469,7 @@ unsafe fn handle_content_click(hwnd: HWND, state: &mut AppState, x: i32, y: i32)
                 return;
             }
 
-            // Card 3: Drag & Drop Experiment Area "Update this file's thumbnail" button (ID 309)
+            // Card 3: Drop zone "Update this file's thumbnail" button (ID 309)
             let card2_h = if !state.settings.monitor_enabled {
                 header_h
             } else {
@@ -4654,6 +4759,10 @@ unsafe fn handle_drop_files(hwnd: HWND, hdrop: HDROP) {
         let path = PathBuf::from(path_str);
 
         if path.is_file() {
+            // A file drop takes the card back from a finished folder run.
+            if !state.prewarm.is_active() {
+                state.prewarm_shown = false;
+            }
             inspect_file_live(state, &path);
             state.active_tab = ManagerTab::Advanced;
             let _ = InvalidateRect(hwnd, None, false);
@@ -4670,8 +4779,17 @@ unsafe fn handle_mouse_wheel(hwnd: HWND, delta: i32) {
     if let Some(mut state_guard) = state_lock() {
         let state: &mut AppState = &mut state_guard;
         if state.active_tab == ManagerTab::Advanced {
-            let total_history = state.monitor_snapshot.as_ref().map(|s| s.history.len()).unwrap_or(0);
-            let max_scroll = total_history.saturating_sub(6);
+            let filtered = state
+                .monitor_snapshot
+                .as_ref()
+                .map(|s| {
+                    s.history
+                        .iter()
+                        .filter(|item| monitor_filter_matches(item, state.monitor_filter, state.monitor_pipeline_filter))
+                        .count()
+                })
+                .unwrap_or(0);
+            let max_scroll = filtered.saturating_sub(state.monitor_visible_rows.get().max(1));
             if delta > 0 {
                 // Scroll up (newer items)
                 state.monitor_scroll = state.monitor_scroll.saturating_sub(1);
@@ -4945,7 +5063,7 @@ fn inspect_file_live(state: &mut AppState, path: &Path) {
                             if let Some(g) = guard {
                                 cbx_core::monitor::record_task_end(g, true, &i18n::t("pipeline.direct_file"), &summary);
                             }
-                            state.monitor_snapshot = cbx_core::monitor::fetch_snapshot();
+                            store_monitor_snapshot(state, cbx_core::monitor::fetch_snapshot());
                             return;
                         }
                     }
@@ -4966,7 +5084,7 @@ fn inspect_file_live(state: &mut AppState, path: &Path) {
         }
     }
 
-    state.monitor_snapshot = cbx_core::monitor::fetch_snapshot();
+    store_monitor_snapshot(state, cbx_core::monitor::fetch_snapshot());
 }
 
 // -----------------------------------------------------------------------------
@@ -6792,7 +6910,7 @@ unsafe fn render_archives_page(hdc: HDC, state: &AppState, x: i32, w: i32) {
 
     // Card 4: Remaining Archive Extraction Options (3 toggles)
     let opt_card_y = sort_card_y + sort_card_h + scale_px(14, state.dpi);
-    let opt_card_h = scale_px(120, state.dpi);
+    let opt_card_h = scale_px(154, state.dpi);
     draw_card_container(hdc, state, x, opt_card_y, w, opt_card_h);
 
     let mut cy = opt_card_y + scale_px(14, state.dpi);
@@ -6805,6 +6923,20 @@ unsafe fn render_archives_page(hdc: HDC, state: &AppState, x: i32, w: i32) {
     cy += row_h;
 
     draw_row_toggle(hdc, state, 7, x, cy, w, tr("跳過單色或過於單純之圖片", "Skip plain or text-only pages"), state.settings.filter_plain_covers, false);
+    cy += row_h;
+
+    draw_row_number_input(
+        hdc,
+        state,
+        EditTarget::ArchiveTimeoutSec,
+        x - scale_px(16, state.dpi),
+        cy,
+        w,
+        tr("壓縮檔處理逾時（5–120）", "Archive time budget (5–120)"),
+        state.settings.max_scan_seconds,
+        tr("秒", "s"),
+        false,
+    );
 
     // Card 5: Dedicated Security Risk Badges & Detection (Win11 Expander / Collapsible Card)
     let risk_card_y = opt_card_y + opt_card_h + scale_px(14, state.dpi);
@@ -8066,12 +8198,22 @@ unsafe fn render_advanced_page(hdc: HDC, state: &AppState, x: i32, w: i32) {
     let (size_x, size_y, size_w, size_h) = prewarm_size_button_geom(state, x, w, card1_y);
     let size_label = format!("{} {} px", tr("縮圖尺寸", "Size"), state.prewarm_size);
     draw_subtle_button(hdc, state, 303, size_x, size_y, size_w, size_h, &size_label, state.prewarm.is_active());
+    // After a run with failures: "retry failed" right in the title row.
+    let failed_now = prewarm_failed_paths(state).len();
+    let hint_right_limit = if failed_now > 0 {
+        let (rx, ry, rw, rh) = prewarm_retry_button_geom(state, x, w, card1_y);
+        let label = format!("{} {failed_now} {}", tr("↻ 重試失敗", "↻ Retry"), tr("項", "failed"));
+        draw_subtle_button(hdc, state, 312, rx, ry, rw, rh, &label, false);
+        rx
+    } else {
+        size_x
+    };
     SelectObject(hdc, state.font_small);
     SetTextColor(hdc, windows::Win32::Foundation::COLORREF(th.text_secondary));
     let mut hint_rc = RECT {
         left: x + scale_px(190, state.dpi),
         top: card1_y + scale_px(16, state.dpi),
-        right: size_x - scale_px(8, state.dpi),
+        right: hint_right_limit - scale_px(8, state.dpi),
         bottom: card1_y + scale_px(36, state.dpi),
     };
     let mut hint_w = to_wide(tr(
@@ -8150,7 +8292,7 @@ unsafe fn render_advanced_page(hdc: HDC, state: &AppState, x: i32, w: i32) {
         }
     }
 
-    // Card 3: Drag & Drop Experiment Area
+    // Card 3: Drop zone — probe a file, or pre-generate thumbnails for a folder
     let drop_y = card2_y + card2_h + scale_px(14, state.dpi);
 
     // Lay out the result text first (word-wrapped to the left of the preview box) so the card can
@@ -8182,13 +8324,33 @@ unsafe fn render_advanced_page(hdc: HDC, state: &AppState, x: i32, w: i32) {
     let th = theme();
     SelectObject(hdc, state.font_bold);
     SetTextColor(hdc, windows::Win32::Foundation::COLORREF(th.text_primary));
-    let test_t = to_wide(tr("拖放檔案實驗區", "Drag & Drop Experiment Area"));
+    let test_t = to_wide(tr("拖放實驗與縮圖產生", "Drop Zone: Probe & Pre-generate"));
     let _ = TextOutW(hdc, x + scale_px(16, state.dpi), drop_y + scale_px(12, state.dpi), &test_t);
 
+    // Hint line; while / after a folder run it shows that run's progress instead.
     SelectObject(hdc, state.font_small);
-    SetTextColor(hdc, windows::Win32::Foundation::COLORREF(th.text_muted));
-    let hint_w = to_wide(tr("將檔案拖放到此視窗以執行探測並顯示各項指標與預覽圖", "Drag and drop a file here to probe and display metrics and thumbnail preview"));
-    let _ = TextOutW(hdc, x + scale_px(16, state.dpi), drop_y + scale_px(32, state.dpi), &hint_w);
+    let (hint_text, hint_color) = if state.prewarm_shown {
+        (prewarm_status_text(state), th.status_ok)
+    } else {
+        (
+            tr(
+                "拖入檔案：探測並顯示各項指標與預覽圖；拖入資料夾：預先產生該資料夾與 3 層子資料夾的縮圖",
+                "Drop a file to probe it and preview its thumbnail; drop a folder to pre-generate thumbnails for it and 3 levels of sub-folders",
+            )
+            .to_string(),
+            th.text_muted,
+        )
+    };
+    SetTextColor(hdc, windows::Win32::Foundation::COLORREF(hint_color));
+    let mut hint_w = to_wide(&hint_text);
+    let mut hint_rc = RECT {
+        left: x + scale_px(16, state.dpi),
+        top: drop_y + scale_px(32, state.dpi),
+        // Stop before the "update this file's thumbnail" button (136 px + 12 px gap).
+        right: prev_x - scale_px(12 + 136 + 8, state.dpi),
+        bottom: drop_y + scale_px(50, state.dpi),
+    };
+    let _ = DrawTextW(hdc, &mut hint_w, &mut hint_rc, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
 
     // Right Side: Live Thumbnail Preview Box
     let prev_y = drop_y + scale_px(18, state.dpi);
@@ -8423,8 +8585,9 @@ unsafe fn render_live_monitor_widget(
     let rows_start_y = metrics_y + scale_px(40, state.dpi);
     let bottom_limit = card_y + card_h - scale_px(18, state.dpi);
     let visible_rows = (((bottom_limit - rows_start_y).max(0) / row_h).max(1) as usize).min(30);
+    state.monitor_visible_rows.set(visible_rows);
 
-    let scroll_offset = state.monitor_scroll.min(history_len.saturating_sub(1));
+    let scroll_offset = state.monitor_scroll.min(history_len.saturating_sub(visible_rows));
     let showing_end = (scroll_offset + visible_rows).min(history_len);
     let scroll_hint = if history_len > visible_rows {
         if matches!(current_lang(), UiLang::En) {
@@ -8443,8 +8606,17 @@ unsafe fn render_live_monitor_widget(
         tr("進行中", "Active"), active_tasks,
         scroll_hint
     );
-    let mw = to_wide(&metrics_str);
-    let _ = TextOutW(hdc, card_x + pad_x, metrics_y + scale_px(2, state.dpi), &mw);
+    let mut mw = to_wide(&metrics_str);
+    // Clipped before the filter dropdowns (they start left of the log actions).
+    let metrics_right = card_x + card_w - pad_x
+        - scale_px(85 + 6 + 85 + 6 + 92 + 17 + 98 + 6 + 104 + 8, state.dpi);
+    let mut metrics_rc = RECT {
+        left: card_x + pad_x,
+        top: metrics_y + scale_px(2, state.dpi),
+        right: metrics_right.max(card_x + pad_x + scale_px(80, state.dpi)),
+        bottom: metrics_y + scale_px(20, state.dpi),
+    };
+    let _ = DrawTextW(hdc, &mut mw, &mut metrics_rc, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
 
     let mon_enabled = state.settings.monitor_enabled;
 
@@ -8456,13 +8628,32 @@ unsafe fn render_live_monitor_widget(
     let exp_w = scale_px(85, state.dpi);
     let exp_x = clr_x - scale_px(6, state.dpi) - exp_w;
     draw_subtle_button(hdc, state, 306, exp_x, metrics_y, exp_w, clr_h, tr("📄 匯出記錄", "📄 Export"), !mon_enabled);
+    let redo_w = scale_px(92, state.dpi);
+    let redo_x = exp_x - scale_px(6, state.dpi) - redo_w;
+    let failed_in_log = state
+        .monitor_log
+        .iter()
+        .filter(|i| !i.success || is_details_timeout_or_aborted(&i.details))
+        .count();
+    let redo_label = format!("{} {failed_in_log}", tr("↻ 重作失敗", "↻ Redo"));
+    draw_subtle_button(
+        hdc,
+        state,
+        307,
+        redo_x,
+        metrics_y,
+        redo_w,
+        clr_h,
+        &redo_label,
+        !mon_enabled || failed_in_log == 0 || state.prewarm.is_active(),
+    );
 
     // 2 Dropdown Filter Buttons on left of the log actions (matching language selector style)
     let dd_h = scale_px(20, state.dpi);
     let dd_gap = scale_px(6, state.dpi);
     let status_dd_w = scale_px(98, state.dpi);
     let pipe_dd_w = scale_px(104, state.dpi);
-    let status_dd_x = exp_x - scale_px(17, state.dpi) - status_dd_w;
+    let status_dd_x = redo_x - scale_px(17, state.dpi) - status_dd_w;
     let pipe_dd_x = status_dd_x - dd_gap - pipe_dd_w;
 
     state.monitor_dropdown_anchor.set((pipe_dd_x, status_dd_x, metrics_y, dd_h));
@@ -8485,7 +8676,7 @@ unsafe fn render_live_monitor_widget(
     draw_monitor_dropdown_button(hdc, state, status_dd_x, metrics_y, status_dd_w, dd_h, status_label, state.open_monitor_dropdown == Some(1), state.pressed_monitor_dropdown == Some(1), !mon_enabled);
 
     // Group separator between the filters and the log action (command-bar style).
-    let sep_x = (status_dd_x + status_dd_w + exp_x) / 2;
+    let sep_x = (status_dd_x + status_dd_w + redo_x) / 2;
     let sep_pen = CreatePen(PS_SOLID, 1, windows::Win32::Foundation::COLORREF(theme().divider));
     let old_sp = SelectObject(hdc, sep_pen);
     let _ = MoveToEx(hdc, sep_x, metrics_y, None);
@@ -8819,6 +9010,73 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
+/// Upper bound of the manager-side activity log.
+const MONITOR_LOG_CAP: usize = 1000;
+/// Successful entries kept in that log; the rest of the room holds failures.
+const MONITOR_LOG_OK_CAP: usize = 200;
+
+/// Merges a fresh shared-memory snapshot into the manager's longer activity log and stores the
+/// snapshot with `history` replaced by that log, so painting, filtering, clicks and the export
+/// all see more than the 64 entries the shared memory keeps.
+fn store_monitor_snapshot(state: &mut AppState, snap: Option<cbx_core::monitor::MonitorSnapshot>) {
+    let Some(mut snap) = snap else {
+        state.monitor_snapshot = None;
+        return;
+    };
+    let total = snap.total_processed;
+    if total < state.monitor_log_total {
+        // Counters were reset (log cleared elsewhere): start over from what is there.
+        state.monitor_log = snap.history.iter().cloned().collect();
+    } else {
+        let new = ((total - state.monitor_log_total) as usize).min(snap.history.len());
+        // A file that now succeeded is no longer "failed": drop its older failure entries.
+        let fixed: std::collections::HashSet<&str> = snap.history[..new]
+            .iter()
+            .filter(|i| i.success && !is_details_timeout_or_aborted(&i.details))
+            .map(|i| i.file_name.as_str())
+            .collect();
+        if !fixed.is_empty() {
+            state.monitor_log.retain(|i| {
+                (i.success && !is_details_timeout_or_aborted(&i.details)) || !fixed.contains(i.file_name.as_str())
+            });
+        }
+        for item in snap.history[..new].iter().rev() {
+            state.monitor_log.push_front(item.clone());
+        }
+        // Keep the rows the user scrolled to in view while new entries arrive on top.
+        if state.monitor_scroll > 0 && new > 0 {
+            let added = snap.history[..new]
+                .iter()
+                .filter(|item| monitor_filter_matches(item, state.monitor_filter, state.monitor_pipeline_filter))
+                .count();
+            state.monitor_scroll += added;
+        }
+    }
+    // Retention: the newest successful entries plus as many failures as fit, so failures stay
+    // available for filtering and "redo failed" long after a large batch.
+    let mut ok_kept = 0usize;
+    state.monitor_log.retain(|i| {
+        if i.success && !is_details_timeout_or_aborted(&i.details) {
+            ok_kept += 1;
+            ok_kept <= MONITOR_LOG_OK_CAP
+        } else {
+            true
+        }
+    });
+    state.monitor_log.truncate(MONITOR_LOG_CAP);
+    state.monitor_log_total = total;
+    snap.history = state.monitor_log.iter().cloned().collect();
+    state.monitor_snapshot = Some(snap);
+}
+
+fn format_duration_short(secs: u64) -> String {
+    if secs >= 3600 {
+        format!("{}:{:02}:{:02}", secs / 3600, (secs / 60) % 60, secs % 60)
+    } else {
+        format!("{}:{:02}", secs / 60, secs % 60)
+    }
+}
+
 fn prewarm_size_button_geom(state: &AppState, x: i32, w: i32, card_y: i32) -> (i32, i32, i32, i32) {
     let bw = scale_px(130, state.dpi);
     (x + w - scale_px(16, state.dpi) - bw, card_y + scale_px(12, state.dpi), bw, scale_px(24, state.dpi))
@@ -8845,7 +9103,88 @@ fn start_prewarm(state: &mut AppState, folder: PathBuf) {
         max_depth: cbx_core::prewarm::MAX_PREWARM_DEPTH,
     };
     state.prewarm_last_done = 0;
-    cbx_core::prewarm::start(folder, opts, std::sync::Arc::clone(&state.prewarm));
+    state.prewarm_started = Some(std::time::Instant::now());
+    cbx_core::prewarm::start(
+        cbx_core::prewarm::PrewarmTarget::Folder(folder),
+        opts,
+        std::sync::Arc::clone(&state.prewarm),
+    );
+}
+
+/// Re-runs thumbnail generation for an explicit list of files (failed items), always
+/// re-extracting and with half the usual workers so slow files get more room.
+fn start_prewarm_files(state: &mut AppState, files: Vec<PathBuf>) -> usize {
+    if state.prewarm.is_active() {
+        return 0;
+    }
+    let mut skipped_network = 0usize;
+    let files: Vec<PathBuf> = files
+        .into_iter()
+        .filter(|f| {
+            let net = cbx_core::media::is_network_path(f);
+            if net && !state.cache_include_network {
+                skipped_network += 1;
+            }
+            !net || state.cache_include_network
+        })
+        .collect();
+    if files.is_empty() {
+        state.prewarm_shown = false;
+        state.cache_status_kind = CacheStatusKind::Custom(if skipped_network > 0 {
+            format!(
+                "⚠️ {}",
+                tr("失敗項目都在網路位置，請先勾選「包含網路設備」", "All failed items are on the network; tick \"Include Network Devices\"")
+            )
+        } else {
+            format!("✓ {}", tr("沒有可重作的失敗項目", "No failed items to redo"))
+        });
+        return 0;
+    }
+    let n = files.len();
+    state.prewarm_shown = true;
+    let opts = cbx_core::prewarm::PrewarmOptions {
+        size: state.prewarm_size,
+        force: true,
+        threads: (cbx_core::prewarm::default_threads() / 2).max(1),
+        max_depth: 0,
+    };
+    state.prewarm_last_done = 0;
+    state.prewarm_started = Some(std::time::Instant::now());
+    cbx_core::prewarm::start(
+        cbx_core::prewarm::PrewarmTarget::Files(files),
+        opts,
+        std::sync::Arc::clone(&state.prewarm),
+    );
+    n
+}
+
+/// Failed / interrupted entries of the activity log that point at files that still exist.
+fn failed_log_paths(state: &AppState) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    for item in &state.monitor_log {
+        if item.success && !is_details_timeout_or_aborted(&item.details) {
+            continue;
+        }
+        let p = PathBuf::from(&item.file_name);
+        if p.is_absolute() && !out.contains(&p) && p.is_file() {
+            out.push(p);
+        }
+    }
+    out
+}
+
+/// Failed files of the last pre-generation run (empty while one is running).
+fn prewarm_failed_paths(state: &AppState) -> Vec<PathBuf> {
+    if state.prewarm.is_active() {
+        return Vec::new();
+    }
+    state.prewarm.failed_paths.lock().map(|f| f.clone()).unwrap_or_default()
+}
+
+fn prewarm_retry_button_geom(state: &AppState, x: i32, w: i32, card_y: i32) -> (i32, i32, i32, i32) {
+    let (size_x, size_y, _, size_h) = prewarm_size_button_geom(state, x, w, card_y);
+    let bw = scale_px(150, state.dpi);
+    (size_x - scale_px(8, state.dpi) - bw, size_y, bw, size_h)
 }
 
 fn prewarm_status_text(state: &AppState) -> String {
@@ -8862,8 +9201,23 @@ fn prewarm_status_text(state: &AppState) -> String {
     }
     if p.running.load(Acquire) {
         let current = p.current.lock().map(|c| c.clone()).unwrap_or_default();
+        // ETA from the average time per finished file so far.
+        let eta = match state.prewarm_started {
+            Some(start) if done > 0 && total > done => {
+                let elapsed = start.elapsed().as_secs_f64();
+                let left = elapsed / done as f64 * (total - done) as f64;
+                format!(
+                    " · {} {} · {} {}",
+                    tr("已用", "elapsed"),
+                    format_duration_short(elapsed as u64),
+                    tr("預估剩餘", "ETA"),
+                    format_duration_short(left.ceil() as u64)
+                )
+            }
+            _ => format!(" · {}", tr("預估剩餘時間計算中…", "estimating time left…")),
+        };
         return format!(
-            "⏳ {done}/{total}（{} {generated}、{} {cached}、{} {failed}）{current}",
+            "⏳ {done}/{total}（{} {generated}、{} {cached}、{} {failed}）{eta} · {current}",
             tr("新產生", "new"),
             tr("已在快取", "cached"),
             tr("失敗", "failed")
@@ -8884,7 +9238,12 @@ fn prewarm_status_text(state: &AppState) -> String {
 unsafe fn prewarm_tick(hwnd: HWND, state: &mut AppState) {
     let active = state.prewarm.is_active();
     let done = state.prewarm.done.load(std::sync::atomic::Ordering::Acquire);
-    if (active && done != state.prewarm_last_done) || active != state.prewarm_was_active {
+    // Repaint on progress, on start / finish, and once a second for the elapsed / ETA clock.
+    let tick = state.prewarm_started.map(|t| t.elapsed().as_secs()).unwrap_or(0) as usize;
+    if (active && (done != state.prewarm_last_done || tick != state.prewarm_last_tick))
+        || active != state.prewarm_was_active
+    {
+        state.prewarm_last_tick = tick;
         state.prewarm_last_done = done;
         state.prewarm_was_active = active;
         if state.active_tab == ManagerTab::Advanced {
@@ -10417,6 +10776,7 @@ fn edit_value_string(state: &AppState, target: EditTarget) -> String {
         EditTarget::MaxGopHops => st.max_gop_hops.to_string(),
         EditTarget::ConsecutiveLimit => st.consecutive_unacceptable_limit.to_string(),
         EditTarget::WatchdogTimeoutSec => st.watchdog_timeout_sec.to_string(),
+        EditTarget::ArchiveTimeoutSec => st.max_scan_seconds.to_string(),
         EditTarget::CustomTextExtensions => st.custom_text_extensions.clone(),
     }
 }
@@ -10518,6 +10878,7 @@ fn clear_active_edit_to_default(state: &mut AppState) {
         EditTarget::MaxGopHops => d.max_gop_hops.to_string(),
         EditTarget::ConsecutiveLimit => d.consecutive_unacceptable_limit.to_string(),
         EditTarget::WatchdogTimeoutSec => d.watchdog_timeout_sec.to_string(),
+        EditTarget::ArchiveTimeoutSec => d.max_scan_seconds.to_string(),
         EditTarget::CustomTextExtensions => d.custom_text_extensions.clone(),
     };
     state.edit_caret_to_end();
@@ -10602,6 +10963,7 @@ unsafe fn draw_row_number_input(
         EditTarget::MaxGopHops => (385, 386),
         EditTarget::ConsecutiveLimit => (390, 391),
         EditTarget::WatchdogTimeoutSec => (400, 401),
+        EditTarget::ArchiveTimeoutSec => (410, 411),
         EditTarget::CustomTextExtensions => (0, 0),
     };
 

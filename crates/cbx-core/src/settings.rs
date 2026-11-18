@@ -238,7 +238,9 @@ pub struct Settings {
     pub filter_plain_covers: bool,
     /// Maximum uncompressed bytes allowed for a single cover candidate (in MiB).
     pub max_image_mb: u32,
-    /// Maximum wall-clock time budget (in seconds) for scanning an archive.
+    /// Archive time budget in seconds (Archives tab, default 30): limits scanning an archive for
+    /// its cover and, in the shell extension, the whole thumbnail request for archive formats
+    /// (instead of the video "single-file time budget").
     pub max_scan_seconds: u32,
 
     // --- Smart Rendering & Media Preview settings ---
@@ -363,7 +365,7 @@ impl Default for Settings {
             anomaly_detection: true,
             filter_plain_covers: true,
             max_image_mb: 256,
-            max_scan_seconds: 20,
+            max_scan_seconds: 30,
 
             position_seek: 25,
             seek_mode: 2, // Default: Smart Duration (智慧時長)

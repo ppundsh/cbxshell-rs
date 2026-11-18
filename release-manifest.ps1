@@ -37,11 +37,22 @@ $ErrorActionPreference = 'Stop'
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location -LiteralPath $Root
 
+# Project-specific values (shared release standard): release.config.psd1 at the repo root.
+$versionFile = 'Cargo.toml'
+$versionRegex = '(?ms)^\[workspace\.package\].*?^version\s*=\s*"([^"]+)"'
+if (Test-Path -LiteralPath 'release.config.psd1') {
+    $cfg = Import-PowerShellDataFile -LiteralPath 'release.config.psd1'
+    if ($cfg.Repo -and -not $PSBoundParameters.ContainsKey('Repo')) { $Repo = $cfg.Repo }
+    if ($cfg.Asset -and -not $PSBoundParameters.ContainsKey('Setup')) { $Setup = Join-Path 'dist' $cfg.Asset }
+    if ($cfg.VersionFile) { $versionFile = $cfg.VersionFile }
+    if ($cfg.VersionRegex) { $versionRegex = $cfg.VersionRegex }
+}
+
 if (-not (Test-Path -LiteralPath $Setup)) { throw "找不到 $Setup，請先執行 build.ps1" }
 
-$cargo = Get-Content -LiteralPath 'Cargo.toml' -Raw
-if ($cargo -notmatch '(?ms)^\[workspace\.package\].*?^version\s*=\s*"([^"]+)"') {
-    throw '無法從 Cargo.toml 的 [workspace.package] 讀取版本'
+$versionText = Get-Content -LiteralPath $versionFile -Raw
+if ($versionText -notmatch $versionRegex) {
+    throw "無法從 $versionFile 讀取版本"
 }
 $version = $Matches[1]
 if (-not $Tag) { $Tag = "v$version" }
@@ -69,7 +80,32 @@ if ($isFile) {
 } else {
     $form = 'inline secret'
 }
-$key = $key.Trim()
+# Pasting / piping can add invisible characters: Windows PowerShell 5.1 re-encodes text piped to
+# a native program (e.g. `$k | gh secret set …`) and prepends a UTF-8 BOM; copy-paste may add
+# zero-width spaces or surrounding quotes. Strip them; base64 never contains them.
+function Remove-Invisible([string]$s) {
+    if ($null -eq $s) { return $s }
+    $s = $s -replace "[\uFEFF\u200B\u200C\u200D\u2060\u00A0]", ''
+    $s = $s.Trim()
+    while ($s.Length -ge 2 -and (($s[0] -eq '"' -and $s[-1] -eq '"') -or ($s[0] -eq "'" -and $s[-1] -eq "'"))) {
+        $s = $s.Substring(1, $s.Length - 2).Trim()
+    }
+    return $s
+}
+$rawLength = $key.Length
+$key = Remove-Invisible $key
+if ($key.Length -ne $rawLength) {
+    Write-Host "    signing key: removed $($rawLength - $key.Length) invisible / quote / whitespace character(s)"
+}
+if ($env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD) {
+    # Only invisible characters and line breaks: a password may legitimately contain spaces or quotes.
+    $pw = $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD -replace "[\uFEFF\u200B\u200C\u200D\u2060]", ''
+    $pw = $pw.TrimEnd("`r", "`n")
+    if ($pw -ne $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD) {
+        Write-Host '    signing key password: removed invisible characters / trailing line break'
+        $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = $pw
+    }
+}
 $compact = ($key -replace '\s', '')
 $once = Get-Utf8FromBase64 $compact
 if ($key.StartsWith('untrusted comment:')) {
@@ -84,7 +120,7 @@ if ($key.StartsWith('untrusted comment:')) {
     $form += ', base64 encoded twice → decoded once'
 } else {
     $hint = if ($once -and $once.Contains('public key')) { ' It looks like a PUBLIC key (.pub); the secret must be the private key file.' } else { '' }
-    throw ("TAURI_SIGNING_PRIVATE_KEY is not a Tauri/minisign secret key ($form, length $($key.Length))." + $hint +
+    throw ("TAURI_SIGNING_PRIVATE_KEY is not a Tauri/minisign secret key ($form, length $($key.Length), raw length $rawLength)." + $hint +
         " Paste the whole content of the private key file (e.g. %USERPROFILE%\.tauri\cbxshell.key) whose .pub matches assets/updater.pub.")
 }
 if ($once -and $once.Contains('public key') -and -not $once.Contains('secret key')) {
