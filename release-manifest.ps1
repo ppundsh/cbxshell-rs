@@ -54,15 +54,53 @@ if ($null -eq $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD) { $env:TAURI_SIGNING_PRIV
 $sig = "$Setup.sig"
 Remove-Item -LiteralPath $sig -ErrorAction SilentlyContinue
 
+# Normalise the key to what the Tauri CLI expects: base64 of the minisign secret-key file
+# (`untrusted comment: …` + key line). Accepted inputs: a path to the key file, that base64
+# text (what `tauri signer generate` writes), the raw minisign text, or base64 applied twice.
+# Only the detected form is printed, never the key.
+function Get-Utf8FromBase64([string]$s) {
+    try { return [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($s)) } catch { return $null }
+}
+$isFile = $false
+try { $isFile = Test-Path -LiteralPath $key -PathType Leaf -ErrorAction SilentlyContinue } catch { }
+if ($isFile) {
+    $key = Get-Content -LiteralPath $key -Raw
+    $form = 'key file path'
+} else {
+    $form = 'inline secret'
+}
+$key = $key.Trim()
+$compact = ($key -replace '\s', '')
+$once = Get-Utf8FromBase64 $compact
+if ($key.StartsWith('untrusted comment:')) {
+    $key = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes(($key -replace "`r", '') + "`n"))
+    $form += ', raw minisign text → base64'
+} elseif ($once -and $once.TrimStart().StartsWith('untrusted comment:')) {
+    $key = $compact
+    $form += ', base64 minisign key'
+} elseif ($once -and (Get-Utf8FromBase64 (($once.Trim()) -replace '\s', '')) -and
+          (Get-Utf8FromBase64 (($once.Trim()) -replace '\s', '')).TrimStart().StartsWith('untrusted comment:')) {
+    $key = ($once.Trim()) -replace '\s', ''
+    $form += ', base64 encoded twice → decoded once'
+} else {
+    $hint = if ($once -and $once.Contains('public key')) { ' It looks like a PUBLIC key (.pub); the secret must be the private key file.' } else { '' }
+    throw ("TAURI_SIGNING_PRIVATE_KEY is not a Tauri/minisign secret key ($form, length $($key.Length))." + $hint +
+        " Paste the whole content of the private key file (e.g. %USERPROFILE%\.tauri\cbxshell.key) whose .pub matches assets/updater.pub.")
+}
+if ($once -and $once.Contains('public key') -and -not $once.Contains('secret key')) {
+    throw 'TAURI_SIGNING_PRIVATE_KEY holds a PUBLIC key; use the private key file instead.'
+}
+Write-Host "    signing key: $form; password: $(if ($env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD) { 'set' } else { 'empty' })"
+
 # The CLI reads the key / password from the environment, so neither appears on a command line.
 $savedKey = $env:TAURI_SIGNING_PRIVATE_KEY
 try {
-    if (Test-Path -LiteralPath $key -PathType Leaf) {
-        $env:TAURI_SIGNING_PRIVATE_KEY_PATH = (Resolve-Path -LiteralPath $key).Path
-        Remove-Item Env:\TAURI_SIGNING_PRIVATE_KEY
-    }
+    $env:TAURI_SIGNING_PRIVATE_KEY = $key
+    Remove-Item Env:\TAURI_SIGNING_PRIVATE_KEY_PATH -ErrorAction SilentlyContinue
     & npx --yes '@tauri-apps/cli@2' signer sign $Setup
-    if ($LASTEXITCODE -ne 0) { throw "tauri signer sign 失敗（exit $LASTEXITCODE）" }
+    if ($LASTEXITCODE -ne 0) {
+        throw "tauri signer sign failed (exit $LASTEXITCODE): check that CBX_UPDATER_KEY / CBX_UPDATER_KEY_PASSWORD match the key in assets/updater.pub"
+    }
 } finally {
     $env:TAURI_SIGNING_PRIVATE_KEY = $savedKey
     Remove-Item Env:\TAURI_SIGNING_PRIVATE_KEY_PATH -ErrorAction SilentlyContinue
