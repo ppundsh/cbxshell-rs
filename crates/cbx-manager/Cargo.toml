@@ -13,3 +13,7 @@ path = "src/main.rs"
 cbx-core = { path = "../cbx-core" }
 windows.workspace = true
 windows-core.workspace = true
+# Ed25519 (minisign) verification of downloaded installers; pure Rust, no dependencies.
+minisign-verify = "0.2"
+# Ed25519 check of the maintainer's YubiKey (FIDO2) release approval; pure Rust, no dependencies.
+ed25519-compact = { version = "2", default-features = false }

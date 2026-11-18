@@ -1,0 +1,70 @@
+#!/bin/sh
+# pre-push: refuse to push commits (and tags) that are not signed by the YubiKey.
+#   gpg.format=ssh      → signer must be listed in gpg.ssh.allowedSignersFile
+#                         (scripts/setup-yubikey.ps1)
+#   gpg.format=openpgp  → good GnuPG signature made by user.signingkey (primary or subkey)
+#                         (scripts/setup-gpg-signing.ps1)
+# Installed via core.hooksPath. Bypass once (e.g. emergency): git push --no-verify
+remote="$1"
+z40=0000000000000000000000000000000000000000
+status=0
+commit_fail=0
+
+format=$(git config --get gpg.format || echo openpgp)
+want_key=$(git config --get user.signingkey | tr -d '!' | tr 'a-f' 'A-F')
+if [ "$format" = "ssh" ]; then
+    if [ -z "$(git config --get gpg.ssh.allowedSignersFile)" ]; then
+        echo "pre-push: gpg.ssh.allowedSignersFile is not set; run scripts/setup-yubikey.ps1 first." >&2
+        exit 1
+    fi
+elif [ -z "$want_key" ]; then
+    echo "pre-push: user.signingkey is not set; run scripts/setup-gpg-signing.ps1 first." >&2
+    exit 1
+fi
+
+# OpenPGP: the signature must also come from the configured key (its fingerprint, the
+# primary key's fingerprint or its long key ID ends with user.signingkey).
+key_ok() {
+    [ "$format" = "ssh" ] && return 0
+    info=$(git log -1 --format='%GF %GP %GK' "$1" | tr 'a-f' 'A-F')
+    for k in $info; do
+        case "$k" in *"$want_key") return 0 ;; esac
+    done
+    return 1
+}
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+    [ "$local_sha" = "$z40" ] && continue                 # deleting a remote ref
+
+    case "$local_ref" in
+    refs/tags/*)
+        if ! git verify-tag "$local_ref" >/dev/null 2>&1; then
+            echo "pre-push: tag ${local_ref#refs/tags/} is not signed (or not by an allowed key)." >&2
+            echo "          create it with: git tag -s <name> -m <message>" >&2
+            status=1
+        fi
+        continue ;;
+    esac
+
+    if [ "$remote_sha" = "$z40" ]; then
+        # New branch: only commits that are not on any remote-tracking branch yet.
+        commits=$(git rev-list "$local_sha" --not --remotes="$remote")
+    else
+        commits=$(git rev-list "$remote_sha..$local_sha")
+    fi
+
+    for c in $commits; do
+        # %G? = G: good signature from an allowed signer. Anything else is rejected.
+        if [ "$(git log -1 --format=%G? "$c")" != "G" ] || ! key_ok "$c"; then
+            [ $commit_fail -eq 0 ] && echo "pre-push: refusing to push unsigned / unverified commits:" >&2
+            git log -1 --format='          %h [%G?] %s' "$c" >&2
+            status=1
+            commit_fail=1
+        fi
+    done
+done
+
+if [ $commit_fail -ne 0 ]; then
+    echo "pre-push: sign them, e.g. git rebase --exec \"git commit --amend --no-edit -S\" <base>" >&2
+fi
+exit $status

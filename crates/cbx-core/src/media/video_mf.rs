@@ -81,11 +81,226 @@ pub fn extract_video_thumbnail_from_stream(
             .map_err(|e| format!("MFCreateMFByteStreamOnStream failed: {e}"))?;
 
         let attr = create_mf_attributes();
-        let reader: IMFSourceReader = MFCreateSourceReaderFromByteStream(&byte_stream, attr.as_ref())
-            .map_err(|e| format!("MFCreateSourceReaderFromByteStream failed: {e}"))?;
-
-        process_source_reader(&reader, side, config, true)
+        let mf_res = match MFCreateSourceReaderFromByteStream(&byte_stream, attr.as_ref()) {
+            Ok(reader) => process_source_reader(&reader, side, config, true),
+            Err(e) => Err(format!("MFCreateSourceReaderFromByteStream failed: {e}")),
+        };
+        match mf_res {
+            Ok(res) => Ok(res),
+            Err(mf_err) => {
+                // Media Foundation cannot demux this container / codec from a stream (FLV, many
+                // MKV, Hi10P ...). Feed the leading part of the stream to FFmpeg through its stdin
+                // instead: the shell host never opens the file (or a network path) itself.
+                match extract_video_thumbnail_ffmpeg_stream(stream, side, config) {
+                    Ok(res) => Ok(res),
+                    Err(ff_err) => Err(format!("{mf_err}; FFmpeg (stream) fallback: {ff_err}")),
+                }
+            }
+        }
     }
+}
+
+/// Stream bytes fed to FFmpeg for header / duration probing.
+const FFMPEG_STREAM_HEAD_BYTES: usize = 2 * 1024 * 1024;
+/// Stream bytes fed per candidate frame (around the estimated byte position of its timestamp).
+const FFMPEG_STREAM_WINDOW_BYTES: usize = 8 * 1024 * 1024;
+/// Bytes read before the estimated position so a keyframe precedes the target time.
+const FFMPEG_STREAM_PREROLL_BYTES: u64 = 2 * 1024 * 1024;
+
+fn stream_size(stream: &IStream) -> Result<u64, String> {
+    use std::io::{Seek, SeekFrom};
+    let mut reader = crate::ComStreamReader::new(stream.clone());
+    reader.seek(SeekFrom::End(0)).map_err(|e| format!("stream size query failed: {e}"))
+}
+
+/// Reads at most `max` bytes of `stream` starting at `offset`, in 1 MiB chunks, giving up once
+/// `deadline` passes: on a slow network share a large read must never outlive the watchdog and
+/// keep the shell host busy after Explorer has already been answered.
+fn read_stream_range(stream: &IStream, offset: u64, max: usize, deadline: std::time::Instant) -> Result<Vec<u8>, String> {
+    use std::io::{Read, Seek, SeekFrom};
+    const CHUNK: usize = 1024 * 1024;
+    let mut reader = crate::ComStreamReader::new(stream.clone());
+    reader.seek(SeekFrom::Start(offset)).map_err(|e| format!("stream seek failed: {e}"))?;
+    let mut data = Vec::with_capacity(max.min(16 * CHUNK));
+    let mut buf = vec![0u8; CHUNK];
+    while data.len() < max {
+        if std::time::Instant::now() >= deadline {
+            return Err("stream read exceeded the time budget".to_string());
+        }
+        let want = (max - data.len()).min(CHUNK);
+        let n = reader.read(&mut buf[..want]).map_err(|e| format!("stream read failed: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        data.extend_from_slice(&buf[..n]);
+    }
+    Ok(data)
+}
+
+/// FFmpeg frame extraction for stream-only files, driven by the same algorithm parameters as the
+/// file pipeline (frame-selection mode, percentage / fixed offset / threshold, step interval,
+/// probe limit, luminance and entropy scoring, watchdog budget, HDR tone-mapping).
+///
+/// FFmpeg reads only from stdin (`-protocol_whitelist pipe`), so it cannot seek. Instead:
+/// 1. the stream head is fed once to read the duration and HDR hints;
+/// 2. for each candidate time the byte position is estimated from duration and stream size,
+///    and the container head plus a window around that position is fed; FFmpeg's demuxers
+///    resynchronise on the jump and the first frame at or after the target is taken;
+/// 3. targets near the start are fed contiguously and selected with an output-side `-ss`.
+fn extract_video_thumbnail_ffmpeg_stream(
+    stream: &IStream,
+    side: u32,
+    config: &SmartRenderConfig,
+) -> Result<(RgbaImage, VideoExtractReport), String> {
+    let ffmpeg_bin = match find_ffmpeg_path() {
+        Some(p) if is_trusted_ffmpeg_bin(&p, Path::new("")) => p,
+        Some(_) => return Err("Rejected untrusted FFmpeg binary path".to_string()),
+        None => return Err(crate::i18n::t("error.ffmpeg_missing")),
+    };
+    let size = stream_size(stream)?;
+    if size == 0 {
+        return Err("empty stream".to_string());
+    }
+    let budget_ms = ((config.watchdog_timeout_sec.clamp(3, 60) as u128) * 1000)
+        .saturating_sub(500)
+        .max(1500);
+    let loop_start = std::time::Instant::now();
+    let deadline = loop_start + std::time::Duration::from_millis(budget_ms as u64);
+    let head = std::sync::Arc::new(read_stream_range(stream, 0, FFMPEG_STREAM_HEAD_BYTES, deadline)?);
+    let remaining = || std::time::Duration::from_millis(budget_ms.saturating_sub(loop_start.elapsed().as_millis()) as u64);
+
+    // 1. Duration / HDR probe from the head.
+    let mut probe = std::process::Command::new(&ffmpeg_bin);
+    prepare_ffmpeg_sandbox(&mut probe, &ffmpeg_bin);
+    probe.args(ffmpeg_input_hardening_args("pipe"));
+    probe.args(["-i", "pipe:0"]);
+    let (duration_sec, is_hdr) = run_ffmpeg_bounded_with_input(
+        &mut probe,
+        remaining().min(std::time::Duration::from_secs(5)),
+        64 * 1024,
+        512 * 1024,
+        Some(head.clone()),
+    )
+    .map(|(_, _, err)| parse_probe_stderr(&err))
+    .unwrap_or((0.0, false));
+    let tonemap_active = config.hdr_tonemap_enabled && is_hdr;
+
+    // Without a duration (some streamed containers) positions cannot be estimated: start at the
+    // beginning and step forward from there.
+    let target_seek_sec = if duration_sec > 0.0 { ffmpeg_target_seek_sec(duration_sec, config) } else { 0.0 };
+    let step_sec = (config.step_probe_sec as f64).clamp(1.0, 60.0);
+    let max_attempts = config.consecutive_unacceptable_limit.clamp(1, 20);
+    let vf_scale = format!("scale=min(iw\\,{side}):-1");
+
+    let mut current_seek_sec = target_seek_sec;
+    let mut best: Option<(RgbaImage, VideoExtractReport)> = None;
+    let mut best_score = f32::MIN;
+    let mut last_err = String::from("no frame decoded");
+
+    for attempt in 1..=max_attempts + 1 {
+        // The extra final round (only when nothing decoded) takes the first frame of the stream.
+        let fallback_round = attempt > max_attempts;
+        if fallback_round && best.is_some() {
+            break;
+        }
+        let left = remaining();
+        if left < std::time::Duration::from_millis(400) {
+            break;
+        }
+        let t = if fallback_round { 0.0 } else { current_seek_sec };
+
+        // Estimated byte position of `t`; near the start (or without a duration) feed contiguously.
+        let est = if duration_sec > 0.0 { ((size as f64) * (t / duration_sec)).clamp(0.0, size as f64) as u64 } else { 0 };
+        let contiguous = duration_sec <= 0.0 || est <= (FFMPEG_STREAM_HEAD_BYTES + FFMPEG_STREAM_WINDOW_BYTES) as u64;
+        let (input, seek_args, vf_arg) = if contiguous {
+            let len = (est as usize).saturating_add(FFMPEG_STREAM_WINDOW_BYTES);
+            let data = if len <= head.len() {
+                (*head).clone()
+            } else {
+                match read_stream_range(stream, 0, len, deadline) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        last_err = e;
+                        break;
+                    }
+                }
+            };
+            (data, vec!["-ss".to_string(), format!("{t:.2}")], vf_scale.clone())
+        } else {
+            let from = est.saturating_sub(FFMPEG_STREAM_PREROLL_BYTES).max(head.len() as u64);
+            let mut data = (*head).clone();
+            match read_stream_range(stream, from, FFMPEG_STREAM_WINDOW_BYTES, deadline) {
+                Ok(d) => data.extend_from_slice(&d),
+                Err(e) => {
+                    last_err = e;
+                    break;
+                }
+            }
+            // Frames from the head are early; take the first one at or after a margin below `t`.
+            let lo = (t * 0.5).max(t - 30.0).max(0.0);
+            (data, Vec::new(), format!("select=gte(t\\,{lo:.2}),{vf_scale}"))
+        };
+
+        let mut cmd = std::process::Command::new(&ffmpeg_bin);
+        prepare_ffmpeg_sandbox(&mut cmd, &ffmpeg_bin);
+        cmd.args(ffmpeg_input_hardening_args("pipe"));
+        cmd.args(["-fflags", "+discardcorrupt", "-i", "pipe:0"]);
+        cmd.args(&seek_args);
+        cmd.args(["-an", "-sn", "-dn", "-vf", vf_arg.as_str(), "-frames:v", "1", "-f", "image2pipe", "-vcodec", "mjpeg", "-q:v", "2", "-"]);
+
+        let step_timeout = left.min(std::time::Duration::from_secs(6));
+        match run_ffmpeg_bounded_with_input(&mut cmd, step_timeout, 16 * 1024 * 1024, 256 * 1024, Some(std::sync::Arc::new(input))) {
+            Some((status, stdout, _stderr)) if status.success() && !stdout.is_empty() => {
+                let mut reader = image::ImageReader::new(std::io::Cursor::new(&stdout));
+                if let Ok(guessed) = reader.with_guessed_format() {
+                    reader = guessed;
+                    let mut lim = image::Limits::default();
+                    lim.max_image_width = Some(crate::image_dec::MAX_IMAGE_DIMENSION);
+                    lim.max_image_height = Some(crate::image_dec::MAX_IMAGE_DIMENSION);
+                    lim.max_alloc = Some(crate::image_dec::MAX_DECODER_ALLOC_BYTES);
+                    reader.limits(lim);
+                    if let Ok(img) = reader.decode() {
+                        let (orig_w, orig_h) = (img.width(), img.height());
+                        let mut rgba = img.to_rgba8();
+                        if tonemap_active {
+                            for px in rgba.chunks_exact_mut(4) {
+                                let (r, g, b) = aces_filmic_tone_mapping(px[0] as f32 / 255.0, px[1] as f32 / 255.0, px[2] as f32 / 255.0);
+                                px[0] = r;
+                                px[1] = g;
+                                px[2] = b;
+                            }
+                        }
+                        let metrics = super::smart_render::evaluate_frame(&rgba, false, config);
+                        let report = VideoExtractReport {
+                            metrics,
+                            attempts_made: attempt,
+                            duration_seconds: duration_sec,
+                            selected_time_seconds: t,
+                            original_width: orig_w,
+                            original_height: orig_h,
+                        };
+                        if metrics.is_accepted {
+                            return Ok((rgba, report));
+                        }
+                        if metrics.score > best_score {
+                            best_score = metrics.score;
+                            best = Some((rgba, report));
+                        }
+                    }
+                }
+            }
+            Some((_, _, stderr)) => {
+                let line = last_stderr_line(&stderr);
+                if !line.is_empty() {
+                    last_err = line;
+                }
+            }
+            None => last_err = "FFmpeg could not be started or timed out".to_string(),
+        }
+        current_seek_sec = ffmpeg_next_seek_sec(current_seek_sec, step_sec, duration_sec);
+    }
+
+    best.ok_or_else(|| format!("FFmpeg (stream) failed to extract a frame ({last_err})"))
 }
 
 /// Extracts a representative video thumbnail from a file path using Media Foundation and Smart Rendering.
@@ -405,6 +620,11 @@ fn resume_suspended_process(pid: u32) -> bool {
 /// * `-codec_whitelist ...` - only mainstream video decoders may be instantiated. Rare/legacy
 ///   decoders are where most memory-safety bugs live (e.g. CVE-2026-8461, a heap out-of-bounds
 ///   write in the MagicYUV decoder); a file cannot force FFmpeg to load a decoder outside this list.
+/// Input-side hardening shared by every FFmpeg invocation.
+///
+/// Only generic `AVFormatContext` options belong here. Demuxer-private options (e.g. the HLS
+/// demuxer's `-max_reload`) are rejected by the ffmpeg CLI with "Option … not found" whenever the
+/// probed demuxer is a different one, which made every FLV / MKV / AVI fallback fail.
 pub(crate) const FFMPEG_INPUT_HARDENING_ARGS: &[&str] = &[
     "-nostdin",
     "-hide_banner",
@@ -414,15 +634,23 @@ pub(crate) const FFMPEG_INPUT_HARDENING_ARGS: &[&str] = &[
     "mov,matroska,webm,avi,asf,flv,mpegts,mpeg,mpegvideo,m4v,ogg,rm,h264,hevc,dv,nut,ivf,obu",
     "-codec_whitelist",
     "h264,hevc,av1,libdav1d,libaom-av1,vp8,vp9,libvpx,libvpx-vp9,mpeg4,mpeg1video,mpeg2video,msmpeg4,msmpeg4v1,msmpeg4v2,wmv1,wmv2,wmv3,vc1,flv,h263,h263p,theora,vp6,vp6f,vp6a,rv10,rv20,rv30,rv40,mjpeg,prores,dvvideo",
-    "-max_reload",
-    "0",
-    "-auto_conversion_filters",
-    "0",
     "-probesize",
     "1048576",
     "-analyzeduration",
     "1000000",
 ];
+
+/// [`FFMPEG_INPUT_HARDENING_ARGS`] with `-protocol_whitelist` set to `protocol` (`file` for paths,
+/// `pipe` when the input bytes are fed through stdin). Everything else stays identical.
+pub(crate) fn ffmpeg_input_hardening_args(protocol: &'static str) -> Vec<&'static str> {
+    let mut args = FFMPEG_INPUT_HARDENING_ARGS.to_vec();
+    if let Some(i) = args.iter().position(|a| *a == "-protocol_whitelist") {
+        if i + 1 < args.len() {
+            args[i + 1] = protocol;
+        }
+    }
+    args
+}
 
 fn read_pipe_bounded<R: std::io::Read>(mut r: R, max_bytes: usize) -> Vec<u8> {
     let mut out = Vec::new();
@@ -454,8 +682,20 @@ fn run_ffmpeg_bounded(
     max_stdout: usize,
     max_stderr: usize,
 ) -> Option<(std::process::ExitStatus, Vec<u8>, Vec<u8>)> {
+    run_ffmpeg_bounded_with_input(cmd, timeout, max_stdout, max_stderr, None)
+}
+
+/// [`run_ffmpeg_bounded`] that optionally writes `input` to the child's stdin (from a separate
+/// thread, so a child that stops reading early can never dead-lock the caller).
+fn run_ffmpeg_bounded_with_input(
+    cmd: &mut std::process::Command,
+    timeout: std::time::Duration,
+    max_stdout: usize,
+    max_stderr: usize,
+    input: Option<std::sync::Arc<Vec<u8>>>,
+) -> Option<(std::process::ExitStatus, Vec<u8>, Vec<u8>)> {
     use std::process::Stdio;
-    cmd.stdin(Stdio::null())
+    cmd.stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     // Start the child suspended so it is confined to the restrictive Job Object *before* it
@@ -497,6 +737,14 @@ fn run_ffmpeg_bounded(
     };
     let stdout_pipe = child.stdout.take();
     let stderr_pipe = child.stderr.take();
+    if let (Some(data), Some(mut stdin)) = (input, child.stdin.take()) {
+        std::thread::spawn(move || {
+            use std::io::Write;
+            // Errors (e.g. broken pipe once FFmpeg has its frame) simply end the feed.
+            let _ = stdin.write_all(&data);
+            drop(stdin);
+        });
+    }
 
     let out_handle = std::thread::spawn(move || {
         stdout_pipe
@@ -562,62 +810,15 @@ fn probe_ffmpeg_info(ffmpeg_bin: &Path, path_str: &str, timeout: std::time::Dura
     cmd.creation_flags(CREATE_NO_WINDOW);
 
     if let Some((_status, _stdout, stderr)) = run_ffmpeg_bounded(&mut cmd, timeout, 64 * 1024, 512 * 1024) {
-        let err_text = String::from_utf8_lossy(&stderr);
-        if let Some(pos) = err_text.find("Duration: ") {
-            let sub = &err_text[pos + 10..];
-            let dur_str = sub.split(',').next().unwrap_or("").trim();
-            let parts: Vec<&str> = dur_str.split(':').collect();
-            if parts.len() == 3 {
-                let h: f64 = parts[0].parse().unwrap_or(0.0);
-                let m: f64 = parts[1].parse().unwrap_or(0.0);
-                let s: f64 = parts[2].parse().unwrap_or(0.0);
-                duration = h * 3600.0 + m * 60.0 + s;
-            }
-        }
-        let lower = err_text.to_lowercase();
-        if lower.contains("bt2020")
-            || lower.contains("smpte2084")
-            || lower.contains("arib-std-b67")
-            || lower.contains("mastering display")
-            || lower.contains("content light")
-            || lower.contains("yuv420p10")
-            || lower.contains("yuv422p10")
-            || lower.contains("yuv444p10")
-        {
-            is_hdr = true;
-        }
+        (duration, is_hdr) = parse_probe_stderr(&stderr);
     }
     (duration, is_hdr)
 }
 
-fn extract_video_thumbnail_ffmpeg(
-    path: &Path,
-    side: u32,
-    config: &SmartRenderConfig,
-) -> Result<(RgbaImage, VideoExtractReport), String> {
-    use std::process::Command;
-    #[cfg(windows)]
-    use std::os::windows::process::CommandExt;
-    #[cfg(windows)]
-    const CREATE_NO_WINDOW: u32 = 0x08000000;
-
-    let ffmpeg_bin = match find_ffmpeg_path() {
-        Some(p) if is_trusted_ffmpeg_bin(&p, path) => p,
-        Some(_) => {
-            return Err("Rejected untrusted FFmpeg binary path".to_string());
-        }
-        None => {
-            return Err(crate::i18n::t("error.ffmpeg_missing"));
-        }
-    };
-
-    let path_str = safe_ffmpeg_input_arg(path);
-    let total_timeout = std::time::Duration::from_secs(config.watchdog_timeout_sec.clamp(3, 60) as u64);
-    let probe_timeout = total_timeout.min(std::time::Duration::from_secs(5));
-    let (duration_sec, is_hdr) = probe_ffmpeg_info(&ffmpeg_bin, &path_str, probe_timeout);
-    let tonemap_active = config.hdr_tonemap_enabled && is_hdr;
-
-    let target_seek_sec = if duration_sec > 5.0 {
+/// Seek target for the FFmpeg pipelines, from the user's frame-selection parameters
+/// (dynamic ratio / percentage / fixed offset, threshold, fixed seconds).
+fn ffmpeg_target_seek_sec(duration_sec: f64, config: &SmartRenderConfig) -> f64 {
+    if duration_sec > 5.0 {
         match config.seek_mode {
             1 => {
                 let fixed = config.seek_fixed_sec as f64;
@@ -652,7 +853,70 @@ fn extract_video_thumbnail_ffmpeg(
         config.seek_fixed_sec as f64
     } else {
         60.0
+    }
+}
+
+/// Next probe position after an unacceptable frame: step forward, wrapping near the end.
+fn ffmpeg_next_seek_sec(current: f64, step_sec: f64, duration_sec: f64) -> f64 {
+    let mut next = current + step_sec;
+    if duration_sec > 0.0 && next >= duration_sec - 2.0 {
+        next = (duration_sec * 0.15)
+            .max(5.0_f64.min((duration_sec * 0.5).max(0.5)))
+            .min((duration_sec - 2.0).max(0.5));
+    }
+    next
+}
+
+/// Duration and HDR hints from FFmpeg's banner on stderr.
+fn parse_probe_stderr(stderr: &[u8]) -> (f64, bool) {
+    let mut duration = 0.0;
+    let err_text = String::from_utf8_lossy(stderr);
+    if let Some(pos) = err_text.find("Duration: ") {
+        let sub = &err_text[pos + 10..];
+        let dur_str = sub.split(',').next().unwrap_or("").trim();
+        let parts: Vec<&str> = dur_str.split(':').collect();
+        if parts.len() == 3 {
+            let h: f64 = parts[0].parse().unwrap_or(0.0);
+            let m: f64 = parts[1].parse().unwrap_or(0.0);
+            let s: f64 = parts[2].parse().unwrap_or(0.0);
+            duration = h * 3600.0 + m * 60.0 + s;
+        }
+    }
+    let lower = err_text.to_lowercase();
+    let is_hdr = ["bt2020", "smpte2084", "arib-std-b67", "mastering display", "content light", "yuv420p10", "yuv422p10", "yuv444p10"]
+        .iter()
+        .any(|k| lower.contains(k));
+    (duration, is_hdr)
+}
+
+fn extract_video_thumbnail_ffmpeg(
+    path: &Path,
+    side: u32,
+    config: &SmartRenderConfig,
+) -> Result<(RgbaImage, VideoExtractReport), String> {
+    use std::process::Command;
+    #[cfg(windows)]
+    use std::os::windows::process::CommandExt;
+    #[cfg(windows)]
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+    let ffmpeg_bin = match find_ffmpeg_path() {
+        Some(p) if is_trusted_ffmpeg_bin(&p, path) => p,
+        Some(_) => {
+            return Err("Rejected untrusted FFmpeg binary path".to_string());
+        }
+        None => {
+            return Err(crate::i18n::t("error.ffmpeg_missing"));
+        }
     };
+
+    let path_str = safe_ffmpeg_input_arg(path);
+    let total_timeout = std::time::Duration::from_secs(config.watchdog_timeout_sec.clamp(3, 60) as u64);
+    let probe_timeout = total_timeout.min(std::time::Duration::from_secs(5));
+    let (duration_sec, is_hdr) = probe_ffmpeg_info(&ffmpeg_bin, &path_str, probe_timeout);
+    let tonemap_active = config.hdr_tonemap_enabled && is_hdr;
+
+    let target_seek_sec = ffmpeg_target_seek_sec(duration_sec, config);
 
     let step_sec = (config.step_probe_sec as f64).clamp(1.0, 60.0);
     let max_attempts = config.consecutive_unacceptable_limit.clamp(1, 20);
@@ -663,6 +927,7 @@ fn extract_video_thumbnail_ffmpeg(
     let mut current_seek_sec = target_seek_sec;
     let mut best_candidate: Option<(RgbaImage, VideoExtractReport)> = None;
     let mut best_score = f32::MIN;
+    let mut last_ffmpeg_error = String::new();
 
     // Use FFmpeg filter to scale directly to thumbnail dimensions using SIMD swscale,
     // and encode as high-quality MJPEG to avoid slow PNG compression overhead.
@@ -692,7 +957,10 @@ fn extract_video_thumbnail_ffmpeg(
 
         let remaining_ms = budget_ms.saturating_sub(loop_start.elapsed().as_millis()).max(500);
         let step_timeout = std::time::Duration::from_millis(remaining_ms.min(6000) as u64);
-        if let Some((status, stdout, _stderr)) = run_ffmpeg_bounded(&mut cmd, step_timeout, 16 * 1024 * 1024, 256 * 1024) {
+        if let Some((status, stdout, stderr)) = run_ffmpeg_bounded(&mut cmd, step_timeout, 16 * 1024 * 1024, 256 * 1024) {
+            if !status.success() || stdout.is_empty() {
+                last_ffmpeg_error = last_stderr_line(&stderr);
+            }
             if status.success() && !stdout.is_empty() {
                 let mut reader = image::ImageReader::new(std::io::Cursor::new(&stdout));
                 if let Ok(guessed) = reader.with_guessed_format() {
@@ -744,19 +1012,31 @@ fn extract_video_thumbnail_ffmpeg(
             }
         }
 
-        current_seek_sec += step_sec;
-        if duration_sec > 0.0 && current_seek_sec >= duration_sec - 2.0 {
-            current_seek_sec = (duration_sec * 0.15)
-                .max(5.0_f64.min((duration_sec * 0.5).max(0.5)))
-                .min((duration_sec - 2.0).max(0.5));
-        }
+        current_seek_sec = ffmpeg_next_seek_sec(current_seek_sec, step_sec, duration_sec);
     }
 
     if let Some(best) = best_candidate {
         return Ok(best);
     }
 
-    Err("FFmpeg failed to extract any valid candidate frame".to_string())
+    if last_ffmpeg_error.is_empty() {
+        Err("FFmpeg failed to extract any valid candidate frame".to_string())
+    } else {
+        Err(format!("FFmpeg failed to extract any valid candidate frame ({last_ffmpeg_error})"))
+    }
+}
+
+/// Last meaningful line of FFmpeg's stderr, bounded and stripped of control characters, so a
+/// failure explains itself (e.g. "Option xyz not found.") without dumping the whole log.
+fn last_stderr_line(stderr: &[u8]) -> String {
+    let text = String::from_utf8_lossy(stderr);
+    let line = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with("Conversion failed"))
+        .last()
+        .unwrap_or("");
+    line.chars().filter(|c| !c.is_control()).take(160).collect()
 }
 
 unsafe fn step_reader_position(

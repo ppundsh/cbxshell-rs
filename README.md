@@ -22,6 +22,8 @@ Detailed implementation guidelines, security specifications, and algorithm metri
 - 📖 **[E-Book Cover Extraction (`doc/ebooks.md`)](./doc/ebooks.md)**: EPUB, IBA, MOBI, AZW, and optional PDF cover extraction with book cover border styling.
 - 🎬 **[Video Frame Evaluation & HDR (`doc/video.md`)](./doc/video.md)**: Seek modes, custom algorithm parameters (`step_probe_sec`, `max_gop_hops`, keyframe probe limits), Rec.601 luminance & Shannon entropy weighted scoring, and HDR ACES tone mapping (enabled by default).
 - 📄 **[Documents, Syntax Previews & Companion Tools (`doc/other.md`)](./doc/other.md)**: Office/PSD thumbnails, 20 syntax-colorized text formats, `cbx-manager.exe`, `cbx-installer.exe`, and `cbx-cli.exe`.
+- ⬆️ **[Installation, Version Check & Auto-Update (`doc/updates.md`)](./doc/updates.md)**: Per-user installer and command-line switches, GitHub Releases version check, minisign-signed in-place updates, and the release signing workflow.
+- 🎨 **[UI Design Guidelines (`doc/ui-design.md`)](./doc/ui-design.md)**: Fluent tokens, corner radii, cards and sub-cards, Acrylic frosted rail, checkbox / toggle / flyout interactions, page-transition timing, and a porting checklist for building apps in the same style.
 
 ### Supported Formats
 - **Comic & Image Archives**: `.cbz`, `.zip`, `.cbr`, `.rar`, `.cb7`, `.7z`, `.cbt`, `.tar`
@@ -62,6 +64,20 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1
 powershell -ExecutionPolicy Bypass -File .\deploy.ps1
 ```
 
+### Versioning & Release
+The version has a single source of truth: `[workspace.package] version` in the root `Cargo.toml`. Every crate inherits it, the Control Center shows it through `env!("CARGO_PKG_VERSION")`, and `build_res.rs` writes it into each binary's PE version resource.
+```powershell
+# Bump patch (2.0.1 -> 2.0.2); also: minor, major, or an explicit X.Y.Z
+.\bump-version.ps1
+
+# Bump, commit "chore(release): vX.Y.Z", create tag vX.Y.Z, and push both (triggers the release workflow)
+.\bump-version.ps1 patch -Push
+
+# Tag and publish the version already in Cargo.toml without bumping
+.\bump-version.ps1 -NoBump -Push
+```
+`-Tag` creates the commit and tag without pushing. Tagging refuses to run with uncommitted tracked changes or when the tag already exists.
+
 ### License & Acknowledgements
 - **License**: Distributed under the **GNU General Public License v3.0 or later (`GPL-3.0-or-later`)**. See [LICENSE](./LICENSE) for details.
 - **Original CBX Shell**: Inspired by the classic C++/ATL **CBXShell** project (originally published under CPOL 1.02). `cbxshell-rs` is a clean-room rewrite in Rust featuring memory-safe archive/document decoders, zero-trust security boundaries, and a modern Windows 11 Control Center.
@@ -87,6 +103,8 @@ Windows 檔案總管多媒體與圖檔封裝縮圖擴充套件，採用 Rust 語
 - 📖 **[電子書封面擷取支援 (`doc/ebooks.zh-TW.md`)](./doc/ebooks.zh-TW.md)**：EPUB、IBA、MOBI、AZW 與可選 PDF 封面解析及書籍封面樣式。
 - 🎬 **[影片影格評定與縮圖產生 (`doc/video.zh-TW.md`)](./doc/video.zh-TW.md)**：定位模式與自訂演算法參數（跳步間隔、`max_gop_hops` 防回彈、探測上限）、Rec.601 亮度與 Shannon 圖像熵加權評分、HDR ACES 色調映射（預設啟用）與 Watchdog 逾時上限。
 - 📄 **[文件、語法預覽與隨附工具 (`doc/other.zh-TW.md`)](./doc/other.zh-TW.md)**：Office／PSD 縮圖、20 種語法上色純文字預覽、`cbx-manager.exe`、`cbx-installer.exe` 與 `cbx-cli.exe` 指令說明。
+- ⬆️ **[安裝、版本檢測與自動更新 (`doc/updates.zh-TW.md`)](./doc/updates.zh-TW.md)**：免管理員權限的安裝程式與命令列參數、GitHub Releases 版本檢測、minisign 簽章驗證的就地更新，以及發行簽署流程。
+- 🎨 **[UI 設計規範 (`doc/ui-design.zh-TW.md`)](./doc/ui-design.zh-TW.md)**：色彩 Token、圓角、卡片與子卡片、Acrylic 磨砂導覽列、Checkbox／Toggle／彈出式選單互動、頁面切換動畫時序，以及供其他專案沿用相同風格的移植檢查清單。
 
 ### 支援格式一覽
 - **圖檔封裝與壓縮檔**：`.cbz`, `.zip`, `.cbr`, `.rar`, `.cb7`, `.7z`, `.cbt`, `.tar`
@@ -126,6 +144,20 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1
 # 本機部署並註冊 COM DLL
 powershell -ExecutionPolicy Bypass -File .\deploy.ps1
 ```
+
+### 版本號與發佈
+版本號只有一個來源：根目錄 `Cargo.toml` 的 `[workspace.package] version`。所有 crate 繼承此值，控制中心以 `env!("CARGO_PKG_VERSION")` 顯示，`build_res.rs` 也據此寫入每個執行檔的 PE 版本資源。
+```powershell
+# 步進修訂號（2.0.1 -> 2.0.2）；也可指定 minor、major 或明確的 X.Y.Z
+.\bump-version.ps1
+
+# 步進、提交「chore(release): vX.Y.Z」、建立標籤 vX.Y.Z 並推送（觸發 Release 工作流程）
+.\bump-version.ps1 patch -Push
+
+# 不步進，直接為目前 Cargo.toml 的版本建立標籤並發佈
+.\bump-version.ps1 -NoBump -Push
+```
+`-Tag` 只建立提交與標籤、不推送。若有尚未提交的追蹤檔變更或標籤已存在，會拒絕執行。
 
 ### 授權條款與設計致謝
 - **授權條款**：本專案採用 **GNU General Public License v3.0 or later (`GPL-3.0-or-later`)** 授權釋出，詳細條文請參閱 [LICENSE](./LICENSE)。

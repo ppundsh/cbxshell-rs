@@ -176,7 +176,7 @@ dependencies = [
 
 [[package]]
 name = "cbx-cli"
-version = "0.1.0"
+version = "2.0.1"
 dependencies = [
  "cbx-core",
  "image",
@@ -192,7 +192,7 @@ dependencies = [
 
 [[package]]
 name = "cbx-core"
-version = "0.1.0"
+version = "2.0.1"
 dependencies = [
  "everything-ipc",
  "image",
@@ -209,7 +209,7 @@ dependencies = [
 
 [[package]]
 name = "cbx-installer"
-version = "0.1.0"
+version = "2.0.1"
 dependencies = [
  "cbx-core",
  "windows 0.58.0",
@@ -219,16 +219,18 @@ dependencies = [
 
 [[package]]
 name = "cbx-manager"
-version = "0.1.0"
+version = "2.0.1"
 dependencies = [
  "cbx-core",
+ "ed25519-compact",
+ "minisign-verify",
  "windows 0.58.0",
  "windows-core 0.58.0",
 ]
 
 [[package]]
 name = "cbxshell"
-version = "0.1.0"
+version = "2.0.1"
 dependencies = [
  "cbx-core",
  "windows 0.58.0",
@@ -451,6 +453,12 @@ dependencies = [
  "const-oid",
  "crypto-common 0.2.2",
 ]
+
+[[package]]
+name = "ed25519-compact"
+version = "2.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9547879431a90e352a35863a54416d92898a787b9af09e6ae2e09a96bd78be80"
 
 [[package]]
 name = "equivalent"
@@ -961,6 +969,12 @@ name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
+
+[[package]]
+name = "minisign-verify"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "22f9645cb765ea72b8111f36c522475d2daa0d22c957a9826437e97534bc4e9e"
 
 [[package]]
 name = "miniz_oxide"

@@ -13,7 +13,7 @@ use windows::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVAT
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 use windows::Win32::UI::Shell::{
     IThumbnailCache, IShellItem, SHChangeNotify, SHCreateItemFromParsingName,
-    SHCNE_ASSOCCHANGED, SHCNE_UPDATEITEM, SHCNF_FLUSHNOWAIT, SHCNF_IDLIST, SHCNF_PATHW,
+    SHCNE_ASSOCCHANGED, SHCNE_UPDATEDIR, SHCNE_UPDATEITEM, SHCNF_FLUSHNOWAIT, SHCNF_IDLIST, SHCNF_PATHW,
     WTS_FORCEEXTRACTION,
 };
 
@@ -449,44 +449,82 @@ pub fn update_single_file_shell_thumbnail(path: &std::path::Path) -> Result<(), 
     if !path.exists() {
         return Err(crate::i18n::t("error.target_not_found"));
     }
+    // Explorer only asks CBX Shell for extensions registered to it; refreshing the cache for any
+    // other type would silently keep the old (or generic) thumbnail.
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| format!(".{}", e.to_ascii_lowercase()))
+        .unwrap_or_default();
+    if ext.is_empty() || !(is_associated(HKEY_CURRENT_USER, &ext) || is_associated(HKEY_LOCAL_MACHINE, &ext)) {
+        return Err(crate::i18n::t_fmt("error.ext_not_associated", &[("ext", if ext.is_empty() { "?" } else { ext.as_str() })]));
+    }
 
     let wide = to_wide(&path.to_string_lossy());
     unsafe {
         let hr_init = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
         let should_uninit = hr_init.is_ok();
 
-        let item: IShellItem = SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None)
-            .map_err(|e| crate::i18n::t_fmt("error.sh_create_item_failed", &[("err", &e.to_string())]))?;
+        let item: IShellItem = match SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None) {
+            Ok(item) => item,
+            Err(e) => {
+                if should_uninit {
+                    CoUninitialize();
+                }
+                return Err(crate::i18n::t_fmt("error.sh_create_item_failed", &[("err", &e.to_string())]));
+            }
+        };
 
         // CLSID_LocalThumbnailCache = {50ef4544-ac9f-4a8e-b21b-8a26180db13f}
         let clsid_local_cache = GUID::from_u128(0x50ef4544_ac9f_4a8e_b21b_8a26180db13f);
-        if let Ok(cache) =
-            CoCreateInstance::<_, IThumbnailCache>(&clsid_local_cache, None, CLSCTX_INPROC_SERVER)
-        {
-            for size in [256u32, 96u32] {
-                let mut bmp = None;
-                let mut flags = Default::default();
-                let mut id = Default::default();
-                let _ = cache.GetThumbnail(
-                    &item,
-                    size,
-                    WTS_FORCEEXTRACTION,
-                    Some(&mut bmp),
-                    Some(&mut flags),
-                    Some(&mut id),
-                );
+        // Re-extract every size Explorer views commonly use (details / list, medium, large,
+        // extra large), so whichever view mode is open picks up the new image.
+        let mut refreshed = 0usize;
+        let mut last_err = String::new();
+        match CoCreateInstance::<_, IThumbnailCache>(&clsid_local_cache, None, CLSCTX_INPROC_SERVER) {
+            Ok(cache) => {
+                for size in [16u32, 32, 48, 96, 256, 768] {
+                    let mut bmp = None;
+                    let mut flags = Default::default();
+                    let mut id = Default::default();
+                    match cache.GetThumbnail(
+                        &item,
+                        size,
+                        WTS_FORCEEXTRACTION,
+                        Some(&mut bmp),
+                        Some(&mut flags),
+                        Some(&mut id),
+                    ) {
+                        Ok(()) => refreshed += 1,
+                        Err(e) => last_err = e.to_string(),
+                    }
+                }
             }
+            Err(e) => last_err = e.to_string(),
         }
 
+        // Tell open folder windows to re-query the item and its folder.
         SHChangeNotify(
             SHCNE_UPDATEITEM,
             SHCNF_PATHW | SHCNF_FLUSHNOWAIT,
             Some(wide.as_ptr().cast()),
             None,
         );
+        if let Some(parent) = path.parent() {
+            let parent_w = to_wide(&parent.to_string_lossy());
+            SHChangeNotify(
+                SHCNE_UPDATEDIR,
+                SHCNF_PATHW | SHCNF_FLUSHNOWAIT,
+                Some(parent_w.as_ptr().cast()),
+                None,
+            );
+        }
 
         if should_uninit {
             CoUninitialize();
+        }
+        if refreshed == 0 {
+            return Err(crate::i18n::t_fmt("error.thumbnail_extract_failed", &[("err", &last_err)]));
         }
     }
     Ok(())

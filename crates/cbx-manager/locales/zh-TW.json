@@ -6,9 +6,9 @@
   "nav.about": "關於",
   "nav.status_ready": "系統就緒",
   "nav.switch_lang": "繁體中文",
-  "sidebar.status_ready": "2.0.0 • 🟢 系統就緒",
-  "sidebar.status_processing": "2.0.0 • 🔵 處理中",
-  "sidebar.status_processing_warn": "2.0.0 • ⚠️ 處理中",
+  "sidebar.status_ready": "🟢 系統就緒",
+  "sidebar.status_processing": "🔵 處理中",
+  "sidebar.status_processing_warn": "⚠️ 處理中",
 
   "cache.title": "系統修復與快取管理",
   "cache.clear_btn": "清理縮圖快取",
@@ -136,5 +136,19 @@
 
   "error.ffmpeg_missing": "未偵測到 FFmpeg 元件。若需支援 10-bit H.264 等特殊格式，請在安裝程式中選擇下載並安裝 FFmpeg，或將系統 FFmpeg 加入 PATH 環境變數。",
   "error.target_not_found": "目標檔案不存在",
-  "error.sh_create_item_failed": "SHCreateItemFromParsingName 失敗: {err}"
+  "error.sh_create_item_failed": "SHCreateItemFromParsingName 失敗: {err}",
+  "error.ext_not_associated": "{ext} 尚未關聯到 CBX Shell，檔案總管不會使用本程式產生縮圖；請先在對應頁面勾選並套用",
+  "error.thumbnail_extract_failed": "縮圖重新擷取失敗: {err}",
+  "trace.network_policy_off": "找到網路位置，但「允許讀取網路共用資料夾」未開啟，改用串流",
+  "trace.network_not_lan": "伺服器 {server} 不符合「只能讀取區域網路」，改用串流",
+  "trace.everything_unavailable": "Everything 未執行或無法連線，改用串流",
+  "trace.everything_no_hit": "Everything 查無同名檔案（請確認該位置已被索引），改用串流",
+  "trace.everything_rejected": "Everything {count} 筆無法採用：{reason}",
+  "reject.path_form": "路徑格式不允許：{path}",
+  "reject.name_mismatch": "檔名不符：{path}",
+  "reject.not_local": "不是本機磁碟：{path}",
+  "reject.not_file": "{err}：{path}",
+  "reject.host_unreachable": "伺服器 {server} 無法連線（Everything 索引可能是舊位址）",
+  "reject.size": "大小不符 {path}：串流 {expected} 位元組，實體檔案 {actual} 位元組",
+  "trace.no_stream_size": "串流未提供檔案大小，無法比對實體檔案，改用串流"
 }

@@ -698,8 +698,60 @@ fn ffmpeg_invocation_is_confined() {
     for banned in ["magicyuv", "indeo3", "indeo4", "indeo5", "cinepak", "smackvid", "bink"] {
         assert!(!codecs.split(',').any(|c| c == banned), "legacy decoder {banned} must not be whitelisted");
     }
+    // Demuxer-private options make the ffmpeg CLI abort ("Option … not found") for every other
+    // container, silently disabling the FFmpeg fallback (FLV, MKV, AVI, …).
+    for private in ["-max_reload", "-live_start_index", "-allowed_extensions", "-auto_conversion_filters"] {
+        assert!(!args.contains(&private), "{private} must not be part of the shared input arguments");
+    }
     let arg = crate::media::video_mf::safe_ffmpeg_input_arg(std::path::Path::new(r"D:\v\-i.mp4"));
     assert!(arg.starts_with("file:"), "input must use explicit file: protocol, got {arg}");
+}
+
+#[test]
+fn stdin_ffmpeg_fallback_only_swaps_the_protocol() {
+    let file_args = crate::media::video_mf::FFMPEG_INPUT_HARDENING_ARGS.to_vec();
+    let pipe_args = crate::media::video_mf::ffmpeg_input_hardening_args("pipe");
+    assert_eq!(file_args.len(), pipe_args.len());
+    let proto = |args: &[&str]| args[args.iter().position(|a| *a == "-protocol_whitelist").unwrap() + 1].to_string();
+    assert_eq!(proto(&pipe_args), "pipe", "stdin variant may only open pipe:");
+    assert_eq!(proto(&file_args), "file");
+    for (a, b) in file_args.iter().zip(pipe_args.iter()) {
+        if *a != "file" {
+            assert_eq!(a, b, "all other hardening flags must be identical");
+        }
+    }
+}
+
+#[test]
+fn network_share_policy_is_opt_in_and_lan_only_by_default() {
+    use crate::media::{is_allowed_network_path_with as allowed, is_lan_host, NetworkSharePolicy as P};
+    let p = |s: &str| std::path::PathBuf::from(s);
+
+    // Defaults from settings: off; when enabled, LAN only.
+    assert_eq!(P::from_settings(false, true), P::Off);
+    assert_eq!(P::from_settings(true, true), P::LanOnly);
+    let d = crate::settings::Settings::default();
+    assert!(!d.allow_network_shares && d.network_lan_only);
+
+    let lan = [r"\\nas\media\a.mkv", r"\\192.168.1.20\v\b.flv", r"\\10.0.0.5\v\c.mp4", r"\\media-pc.local\v\d.mkv", r"\\fe80--1.ipv6-literal.net\v\e.mkv"];
+    let remote = [r"\\8.8.8.8\v\a.mkv", r"\\files.example.com\v\a.mkv", r"\\host@SSL\DavWWWRoot\a.mkv", r"\\2001-db8--1.ipv6-literal.net\v\a.mkv"];
+    let never = [r"\\?\UNC\nas\v\a.mkv", r"\\.\pipe\x", r"\\nas\v\..\..\a.mkv", r"\\nas\v\a.mkv:ads", r"\\nas", r"\\nas\"];
+
+    for s in lan.iter().chain(remote.iter()).chain(never.iter()) {
+        assert!(!allowed(&p(s), P::Off), "policy Off must reject {s}");
+    }
+    for s in lan {
+        assert!(allowed(&p(s), P::LanOnly), "LAN-only must accept {s}");
+        assert!(allowed(&p(s), P::Any));
+    }
+    for s in remote {
+        assert!(!allowed(&p(s), P::LanOnly), "LAN-only must reject {s}");
+    }
+    assert!(allowed(&p(r"\\files.example.com\v\a.mkv"), P::Any));
+    for s in never {
+        assert!(!allowed(&p(s), P::Any), "{s} must never be opened");
+    }
+    assert!(is_lan_host("NAS") && is_lan_host("172.20.1.1") && !is_lan_host("172.32.0.1") && !is_lan_host("evil.com"));
 }
 
 // ---------------------------------------------------------------------------
@@ -745,7 +797,10 @@ fn repository_contains_no_build_machine_paths_or_personal_data() {
     const TEXT_EXT: &[&str] = &[
         "rs", "toml", "md", "ps1", "yml", "yaml", "json", "def", "manifest", "txt", "gitignore",
     ];
-    let allowed_email_domains = ["example.com", "example.org", "example.invalid", "users.noreply.github.com"];
+    // `openssh.com`: OpenSSH algorithm names such as `sk-ssh-ed25519@openssh.com`.
+    let allowed_email_domains = ["example.com", "example.org", "example.invalid", "users.noreply.github.com", "openssh.com"];
+    // Well-known service addresses that are not personal data (SSH remote user).
+    let allowed_addresses = ["git@github.com"];
 
     // Mirror what would be committed: skip root-anchored files (`/name`) and simple `*.ext`
     // patterns from the workspace `.gitignore` (local maintenance helpers, logs, ...).
@@ -755,6 +810,13 @@ fn repository_contains_no_build_machine_paths_or_personal_data() {
         .map(str::trim)
         .filter(|l| l.starts_with('/') && !l.ends_with('/'))
         .map(|l| l.trim_start_matches('/').to_ascii_lowercase())
+        .collect();
+    // Root-anchored directories (`/name/`), e.g. the maintainer's private notes.
+    let ignored_root_dirs: Vec<String> = gitignore
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with('/') && l.ends_with('/') && l.len() > 2)
+        .map(|l| l.trim_matches('/').to_ascii_lowercase())
         .collect();
     let ignored_exts: Vec<String> = gitignore
         .lines()
@@ -771,7 +833,9 @@ fn repository_contains_no_build_machine_paths_or_personal_data() {
             let p = e.path();
             let name = e.file_name().to_string_lossy().to_string();
             if p.is_dir() {
-                if !matches!(name.as_str(), "target" | ".git" | "dist" | "images" | "node_modules") {
+                let root_ignored =
+                    p.parent() == Some(root.as_path()) && ignored_root_dirs.contains(&name.to_ascii_lowercase());
+                if !root_ignored && !matches!(name.as_str(), "target" | ".git" | "dist" | "images" | "node_modules") {
                     stack.push(p);
                 }
                 continue;
@@ -805,6 +869,18 @@ fn repository_contains_no_build_machine_paths_or_personal_data() {
                     .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-'))
                     .collect();
                 let after = after.trim_end_matches('.');
+                let local: String = text[..i]
+                    .chars()
+                    .rev()
+                    .take(before)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect();
+                let address = format!("{local}@{after}");
+                if allowed_addresses.iter().any(|a| address.eq_ignore_ascii_case(a)) {
+                    continue;
+                }
                 if before >= 1
                     && after.contains('.')
                     && after.rsplit('.').next().map_or(false, |tld| tld.len() >= 2 && tld.chars().all(|c| c.is_ascii_alphabetic()))

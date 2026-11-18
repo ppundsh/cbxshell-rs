@@ -2,6 +2,8 @@
 
 mod render_aa;
 mod i18n;
+mod update_core;
+mod updater;
 
 use cbx_core::icon::create_app_hicon;
 use cbx_core::media::{
@@ -20,18 +22,19 @@ use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{ERROR_SUCCESS, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
-    DwmExtendFrameIntoClientArea, DwmSetWindowAttribute, DWMWA_SYSTEMBACKDROP_TYPE,
+    DwmDefWindowProc, DwmExtendFrameIntoClientArea, DwmSetWindowAttribute, DWMWA_SYSTEMBACKDROP_TYPE,
     DWMWA_USE_IMMERSIVE_DARK_MODE,
 };
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateCompatibleBitmap, CreateCompatibleDC, CreateDIBSection, CreateFontW,
     CreatePen, CreateRectRgn, CreateRoundRectRgn, CreateSolidBrush, DeleteDC, DeleteObject,
-    DrawTextW, EndPaint, FillRect, GetStockObject, HRGN, InvalidateRect, LineTo, MoveToEx,
+    DrawTextW, EndPaint, FillRect, HRGN, InvalidateRect, LineTo, MoveToEx,
     Polygon, RoundRect, SelectClipRgn, SelectObject, SetBkMode, SetStretchBltMode, SetTextColor,
     StretchBlt, TextOutW, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CLEARTYPE_QUALITY,
     DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS, DT_CALCRECT, DT_CENTER, DT_END_ELLIPSIS,
     DT_LEFT, DT_NOPREFIX, DT_PATH_ELLIPSIS, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, DT_WORDBREAK,
-    FF_DONTCARE, FW_BOLD, FW_NORMAL, HALFTONE, HBITMAP, HDC, HFONT, NULL_BRUSH, PAINTSTRUCT,
+    DT_EDITCONTROL,
+    FF_DONTCARE, FW_NORMAL, HALFTONE, HBITMAP, HDC, HFONT, PAINTSTRUCT,
     PS_SOLID, SRCCOPY, TRANSPARENT,
 };
 use windows::Win32::UI::Controls::{
@@ -43,7 +46,8 @@ use windows::Win32::System::Registry::{
     HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, RegGetValueW, RRF_RT_REG_BINARY, RRF_RT_REG_DWORD,
 };
 use windows::Win32::UI::HiDpi::{
-    GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+    GetDpiForWindow, GetSystemMetricsForDpi, SetProcessDpiAwarenessContext,
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows::Win32::UI::Shell::{
     DragAcceptFiles, DragFinish, DragQueryFileW, HDROP,
@@ -51,13 +55,23 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetClientRect,
+    CreateWindowExW, DefWindowProcW, DispatchMessageW, IsZoomed, SetWindowPos, SetWindowTextW,
+    NCCALCSIZE_PARAMS, SM_CXPADDEDBORDER, SM_CYCAPTION, SM_CYSIZEFRAME, SWP_FRAMECHANGED,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
     GetMessageW, GetSystemMetrics, KillTimer, LoadCursorW, PostQuitMessage,
     RegisterClassW, SetTimer, ShowWindow, TranslateMessage, SetCursor, IDC_ARROW, IDC_HAND, IDC_SIZENS, MSG,
     SM_CXSCREEN, SM_CYSCREEN, SW_SHOW, WM_CREATE, WM_DESTROY, WM_DROPFILES,
     WM_ERASEBKGND, WM_GETMINMAXINFO, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_SIZE, WM_TIMER, WM_CHAR, WM_SETCURSOR,
     MINMAXINFO, WNDCLASSW, WS_CAPTION, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU, WS_THICKFRAME,
 };
+
+// Non-client messages and hit-test codes used by the custom title bar.
+const WM_NCCALCSIZE: u32 = 0x0083;
+const WM_KEYDOWN_MSG: u32 = 0x0100;
+const WM_NCHITTEST: u32 = 0x0084;
+const HTCLIENT: isize = 1;
+const HTCAPTION: isize = 2;
+const HTTOP: isize = 12;
 
 #[repr(C)]
 #[allow(non_snake_case)]
@@ -90,6 +104,114 @@ struct OPENFILENAMEW {
 #[link(name = "comdlg32")]
 extern "system" {
     fn GetOpenFileNameW(lpofn: *mut OPENFILENAMEW) -> windows::Win32::Foundation::BOOL;
+    fn GetSaveFileNameW(lpofn: *mut OPENFILENAMEW) -> windows::Win32::Foundation::BOOL;
+}
+
+/// "Save as" dialog for the activity-log export; returns the chosen path.
+unsafe fn prompt_save_log(hwnd: HWND, default_name: &str) -> Option<String> {
+    let mut file_buf = [0u16; 1024];
+    for (i, c) in default_name.encode_utf16().take(file_buf.len() - 1).enumerate() {
+        file_buf[i] = c;
+    }
+    let filter = "Text (*.txt)\0*.txt\0All Files (*.*)\0*.*\0\0";
+    let filter_w: Vec<u16> = filter.encode_utf16().collect();
+    let title_w = to_wide(tr("匯出運作紀錄", "Export Activity Log"));
+    let def_ext = to_wide("txt");
+    let mut ofn = OPENFILENAMEW {
+        lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
+        hwndOwner: hwnd,
+        hInstance: HINSTANCE::default(),
+        lpstrFilter: PCWSTR(filter_w.as_ptr()),
+        lpstrCustomFilter: windows::core::PWSTR::null(),
+        nMaxCustFilter: 0,
+        nFilterIndex: 1,
+        lpstrFile: windows::core::PWSTR(file_buf.as_mut_ptr()),
+        nMaxFile: file_buf.len() as u32,
+        lpstrFileTitle: windows::core::PWSTR::null(),
+        nMaxFileTitle: 0,
+        lpstrInitialDir: PCWSTR::null(),
+        lpstrTitle: PCWSTR(title_w.as_ptr()),
+        Flags: 0x00000002 | 0x00000800 | 0x00000008, // OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR
+        nFileOffset: 0,
+        nFileExtension: 0,
+        lpstrDefExt: PCWSTR(def_ext.as_ptr()),
+        lCustData: 0,
+        lpfnHook: None,
+        lpTemplateName: PCWSTR::null(),
+        pvReserved: std::ptr::null_mut(),
+        dwReserved: 0,
+        FlagsEx: 0,
+    };
+    if GetSaveFileNameW(&mut ofn).as_bool() {
+        let len = file_buf.iter().position(|&c| c == 0).unwrap_or(file_buf.len());
+        if len > 0 {
+            return Some(String::from_utf16_lossy(&file_buf[..len]));
+        }
+    }
+    None
+}
+
+/// Plain-text activity log for troubleshooting: environment summary, then every entry of the
+/// monitor history (newest first) with its pipeline, resolution trace and details.
+fn format_activity_log(state: &AppState, snap: &cbx_core::monitor::MonitorSnapshot) -> String {
+    use std::fmt::Write as _;
+    let st = &state.settings;
+    let on_off = |b: bool| if b { "on" } else { "off" };
+    let mut out = String::new();
+    let _ = writeln!(out, "CBX Shell {APP_VERSION} - activity log");
+    let ev = cbx_core::media::get_everything_version().unwrap_or_else(|| "not detected".to_string());
+    let _ = writeln!(out, "Everything: {ev}");
+    let _ = writeln!(out, "FFmpeg: {}", if st.custom_ffmpeg_path.trim().is_empty() { "auto-detect" } else { "custom path" });
+    let _ = writeln!(out, "Network shares: {} (local network only: {})", on_off(st.allow_network_shares), on_off(st.network_lan_only));
+    let _ = writeln!(out, "Custom video parameters: {}  watchdog: {} s", on_off(st.custom_video_settings), st.watchdog_timeout_sec);
+    let _ = writeln!(
+        out,
+        "Processed: {}  average: {} ms  active: {}  entries: {}",
+        snap.total_processed,
+        snap.avg_duration_ms,
+        snap.active_tasks,
+        snap.history.len()
+    );
+    if !snap.current_file.is_empty() {
+        let _ = writeln!(out, "In progress: {} ({}, {} ms)", snap.current_file, snap.current_stage, snap.current_elapsed_ms);
+    }
+    let _ = writeln!(out);
+    for item in &snap.history {
+        let _ = writeln!(
+            out,
+            "[{}] {:<5} {:>7} ms  {}",
+            item.time_str,
+            item.ext.trim_start_matches('.').to_uppercase(),
+            item.duration_ms,
+            if item.success { "OK" } else { "FAIL" }
+        );
+        let _ = writeln!(out, "  file:     {}", item.file_name);
+        let _ = writeln!(out, "  pipeline: {}", item.pipeline);
+        let _ = writeln!(out, "  trace:    {}", item.search_trace);
+        let _ = writeln!(out, "  details:  {}", item.details.replace('\n', " / "));
+        let _ = writeln!(out);
+    }
+    out
+}
+
+/// Export button action: asks for a file and writes the log there (UTF-8 with BOM).
+unsafe fn export_activity_log(hwnd: HWND, state: &mut AppState) {
+    let Some(snap) = cbx_core::monitor::fetch_snapshot() else {
+        state.cache_status_kind = CacheStatusKind::Custom(format!("✗ {}", tr("目前沒有可匯出的運作紀錄", "No activity log to export")));
+        state.cache_status_msg = state.get_cache_status_display();
+        return;
+    };
+    let Some(path) = prompt_save_log(hwnd, "cbxshell-activity-log.txt") else {
+        return;
+    };
+    let text = format_activity_log(state, &snap);
+    let mut bytes = vec![0xEF, 0xBB, 0xBF];
+    bytes.extend_from_slice(text.replace('\n', "\r\n").as_bytes());
+    state.cache_status_kind = CacheStatusKind::Custom(match std::fs::write(&path, bytes) {
+        Ok(()) => format!("✓ {} {}", tr("已匯出運作紀錄：", "Activity log exported:"), path),
+        Err(e) => format!("✗ {e}"),
+    });
+    state.cache_status_msg = state.get_cache_status_display();
 }
 
 unsafe fn prompt_select_ffmpeg(hwnd: HWND) -> Option<String> {
@@ -202,6 +324,27 @@ unsafe fn copy_to_clipboard(hwnd: HWND, text: &str) -> bool {
 
 static CURRENT_LANG: AtomicU8 = AtomicU8::new(0);
 const SIDEBAR_BASE_WIDTH: i32 = 195;
+/// Width of the collapsed navigation rail (96-DPI px): 10 px margins around a 40 px pill.
+const SIDEBAR_COLLAPSED_WIDTH: i32 = 60;
+/// Height of the custom title bar strip (96-DPI px), Task Manager style.
+const TITLEBAR_BASE_H: i32 = 48;
+/// Navigation-rail toggle ("hamburger") button: top and size (96-DPI px), below the title bar.
+const HAMBURGER_Y: i32 = 2;
+const HAMBURGER_W: i32 = 40;
+const HAMBURGER_H: i32 = 36;
+/// Rail collapse / expand animation length (seconds).
+const SIDEBAR_ANIM_SECS: f32 = 0.20;
+/// Extra left / right inset (96-DPI px) of rows inside an expanded expander card.
+const EXPANDER_CONTENT_INDENT: i32 = 16;
+/// Language button height (96-DPI px): same as a navigation pill.
+const LANG_BTN_H: i32 = 40;
+/// Width of the icon column shared by the rail toggle, nav items and the language button, so
+/// every glyph is centred on the same vertical line.
+const RAIL_ICON_COL_W: i32 = 40;
+/// Top of the first navigation item (96-DPI px); items are 44 px tall.
+const NAV_START_Y: i32 = 48;
+/// Product version, single source of truth: `[workspace.package] version` in Cargo.toml.
+const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 // Dynamic Windows Personalization > Colors Accent Palette (stored as 0x00RRGGBB)
 static ACCENT_BASE_RGB: AtomicU32 = AtomicU32::new(0x000078D4);
@@ -366,13 +509,20 @@ pub(crate) fn refresh_system_theme(hwnd: Option<HWND>) {
 // Windows builds, API failure, "Transparency effects" turned off) those pixels would be fully
 // see-through and show the desktop/windows behind *unblurred*. `apply_frosted_backdrop`
 // therefore tries, in order:
-//   1. Windows 11 22H2+ : DWMWA_SYSTEMBACKDROP_TYPE = DWMSBT_TRANSIENTWINDOW (Acrylic, frosted)
-//   2. Windows 10 1803+ / Windows 11 21H2 : SetWindowCompositionAttribute acrylic blur-behind
+//   1. Windows 11 22H2+ : DWMWA_SYSTEMBACKDROP_TYPE = DWMSBT_MAINWINDOW (Mica: a heavily blurred,
+//      tinted copy of the desktop wallpaper that stays fixed relative to the screen)
+//   2. Windows 11 21H2  : the original DWMWA_MICA_EFFECT attribute (1029)
+//   3. Windows 10 1803+ : SetWindowCompositionAttribute acrylic blur-behind
 // and records whether one succeeded. When none did, `render_fluent_ui` flattens every
 // translucent pixel onto an opaque Mica-like base colour, so the window never becomes clear glass.
 
-/// DWMSBT_TRANSIENTWINDOW (Acrylic). Use 2 (Mica) or 4 (Mica Alt) for the subtler wallpaper tint.
-const FROSTED_BACKDROP_TYPE: i32 = 3;
+/// DWMSBT_MAINWINDOW (Mica). 3 = Acrylic (blurs whatever is behind), 4 = Mica Alt.
+const FROSTED_BACKDROP_TYPE: i32 = 2;
+/// Pre-22H2 Windows 11 Mica switch (undocumented but stable in build 22000).
+const DWMWA_MICA_EFFECT_21H2: u32 = 1029;
+/// Opacity of the page background (`win_bg`) laid over the Mica backdrop outside the cards, so
+/// the content area shows the same wallpaper glow as the rail, only deeper.
+const CONTENT_MICA_TINT_ALPHA: u32 = 0xB4;
 
 static BACKDROP_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -499,6 +649,16 @@ fn apply_frosted_backdrop(hwnd: HWND) {
                     hwnd,
                     DWMWA_SYSTEMBACKDROP_TYPE,
                     &FROSTED_BACKDROP_TYPE as *const _ as _,
+                    4,
+                )
+                .is_ok()
+            {
+                true
+            } else if build >= 22000
+                && DwmSetWindowAttribute(
+                    hwnd,
+                    windows::Win32::Graphics::Dwm::DWMWINDOWATTRIBUTE(DWMWA_MICA_EFFECT_21H2 as i32),
+                    &1i32 as *const _ as _,
                     4,
                 )
                 .is_ok()
@@ -861,6 +1021,24 @@ pub enum MonitorPipelineFilter {
     StreamRpc = 4,
 }
 
+/// Geometry of a painted, enabled text box.
+#[derive(Clone, Copy)]
+struct EditBoxGeom {
+    target: EditTarget,
+    rect: RECT,
+    text_left: i32,
+    text_right: i32,
+    font: HFONT,
+}
+
+// user32 functions outside the enabled windows-rs feature set.
+#[link(name = "user32")]
+extern "system" {
+    fn GetKeyState(vkey: i32) -> i16;
+    fn SetCapture(hwnd: HWND) -> HWND;
+    fn ReleaseCapture() -> windows::Win32::Foundation::BOOL;
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum EditTarget {
     SeekFixedSec,
@@ -889,8 +1067,17 @@ struct AppState {
     // Mouse position & interactive hover tracking
     mouse_pos: (i32, i32),
     active_edit: Option<EditTarget>,
+    /// Screen rectangle of the focused text box's clear ("X") button, recorded while painting.
+    edit_clear_rect: std::cell::Cell<Option<RECT>>,
+    edit_clear_pressed: bool,
     edit_buffer: String,
-    edit_select_all: bool,
+    /// Caret and selection anchor in `edit_buffer` (byte offsets; the buffer is ASCII-only).
+    edit_caret: usize,
+    edit_anchor: usize,
+    /// Mouse-drag text selection in progress.
+    edit_dragging: bool,
+    /// Text boxes painted in the last frame (screen coordinates), for caret hit-testing.
+    edit_boxes: std::cell::RefCell<Vec<EditBoxGeom>>,
     has_unapplied_text_edits: bool,
     applied_custom_timer: Option<std::time::Instant>,
 
@@ -906,6 +1093,13 @@ struct AppState {
     cache_status_kind: CacheStatusKind,
     cache_include_network: bool,
     cache_force_refresh: bool,
+    /// Folder thumbnail pre-generation (Advanced › 填充縮圖快取 / folder drop).
+    prewarm: std::sync::Arc<cbx_core::prewarm::PrewarmProgress>,
+    prewarm_size: u32,
+    /// Show the pre-generation status instead of the cache status line.
+    prewarm_shown: bool,
+    prewarm_last_done: usize,
+    prewarm_was_active: bool,
 
     // Pending extension associations
     pending_associations: HashMap<String, bool>,
@@ -920,6 +1114,8 @@ struct AppState {
     // Real-time thumbnail monitor snapshot & scroll position
     monitor_snapshot: Option<cbx_core::monitor::MonitorSnapshot>,
     monitor_scroll: usize,
+    /// Minutes left before unlocked logging switches off (as last painted).
+    monitor_left_min: Option<u64>,
     monitor_filter: MonitorFilter,
     monitor_pipeline_filter: MonitorPipelineFilter,
     open_monitor_dropdown: Option<u8>,
@@ -959,14 +1155,30 @@ struct AppState {
     drag_resizer_start_h: i32,
 
     about_card1_h: std::cell::Cell<i32>,
+    /// Height of the drag & drop experiment card, grown to fit wrapped result text.
+    drop_card_h: std::cell::Cell<i32>,
     video_card_tools_h: std::cell::Cell<i32>,
     video_everything_btn_rel_y: std::cell::Cell<i32>,
+    /// Top of the "network shares" sub-card, relative to the tools card (layout feedback).
+    video_net_sub_rel_y: std::cell::Cell<i32>,
     hover_slider: Option<usize>,
 
     // Win11 Language Flyout Menu state
     is_lang_menu_open: bool,
     hover_lang_item: Option<usize>,
+    /// Flyout item under a pressed (not yet released) mouse button; selection happens on release.
+    pressed_lang_item: Option<usize>,
+    pressed_monitor_dd_item: Option<usize>,
+    /// Start of the current flyout item press (drives the selected-indicator squash).
+    flyout_press_start: Option<std::time::Instant>,
     lang_btn_pressed: bool,
+    /// Navigation rail collapsed to icons only (target state).
+    sidebar_collapsed: bool,
+    /// Eased collapse progress: 0 = expanded, 1 = collapsed.
+    sidebar_anim: f32,
+    sidebar_anim_from: f32,
+    sidebar_anim_start: Option<std::time::Instant>,
+    hamburger_pressed: bool,
     lang_menu_anim: f32,
     lang_menu_anim_start: Option<std::time::Instant>,
     pressed_tab: Option<usize>,
@@ -997,6 +1209,13 @@ struct AppState {
     video_params_expand_anim: f32,
     video_params_anim_start: Option<(std::time::Instant, bool)>,
     is_video_params_header_hovered: bool,
+    /// "Everything search helper" expander card on the Video page.
+    is_ev_expanded: bool,
+    ev_expand_anim: f32,
+    ev_anim_start: Option<(std::time::Instant, bool)>,
+    is_ev_header_hovered: bool,
+    /// Top of the Everything card relative to the FFmpeg card (layout feedback).
+    video_ev_card_rel_y: std::cell::Cell<i32>,
 
     // CheckBox left-to-right checkmark draw animation state
     checkbox_states: std::cell::RefCell<HashMap<u32, bool>>,
@@ -1010,7 +1229,13 @@ struct AppState {
 impl AppState {
     fn new(dpi: u32) -> Self {
         refresh_system_accent_palette();
-        let settings = Settings::load();
+        let mut settings = Settings::load();
+        // Unlocked logging that expired while the manager was closed is switched off for real.
+        if settings.monitor_enabled && !settings.monitor_effective(unix_now()) {
+            settings.monitor_enabled = false;
+            settings.monitor_locked = false;
+            let _ = settings.save();
+        }
         // Keep HKCU UserChoiceLatest ProgId & TypeOverlay="" synced on launch for active formats
         {
             let hkcu = windows::Win32::System::Registry::HKEY_CURRENT_USER;
@@ -1036,7 +1261,7 @@ impl AppState {
         let font_chevron = create_chevron_font(scale(10));
 
         let item_h = scale_px(44, dpi) as f32;
-        let start_y = scale_px(85, dpi) as f32;
+        let start_y = scale_px(NAV_START_Y, dpi) as f32;
         let init_y = start_y + item_h / 2.0;
         let init_h = scale_px(20, dpi) as f32;
         let mon_init_anim = if settings.monitor_enabled { 1.0 } else { 0.0 };
@@ -1054,8 +1279,13 @@ impl AppState {
             font_chevron,
             mouse_pos: (0, 0),
             active_edit: None,
+            edit_clear_rect: std::cell::Cell::new(None),
+            edit_clear_pressed: false,
             edit_buffer: String::new(),
-            edit_select_all: false,
+            edit_caret: 0,
+            edit_anchor: 0,
+            edit_dragging: false,
+            edit_boxes: std::cell::RefCell::new(Vec::new()),
             has_unapplied_text_edits: false,
             applied_custom_timer: None,
             test_path: None,
@@ -1067,12 +1297,18 @@ impl AppState {
             cache_status_kind: CacheStatusKind::Idle,
             cache_include_network: false,
             cache_force_refresh: false,
+            prewarm: Default::default(),
+            prewarm_size: 256,
+            prewarm_shown: false,
+            prewarm_last_done: 0,
+            prewarm_was_active: false,
             pending_associations: HashMap::new(),
             dragging_slider: None,
             toggle_anims: HashMap::new(),
             toggle_targets: HashMap::new(),
             monitor_snapshot: cbx_core::monitor::fetch_snapshot(),
             monitor_scroll: 0,
+            monitor_left_min: None,
             monitor_filter: MonitorFilter::All,
             monitor_pipeline_filter: MonitorPipelineFilter::All,
             open_monitor_dropdown: None,
@@ -1106,13 +1342,23 @@ impl AppState {
             drag_resizer_start_h: 0,
 
             about_card1_h: std::cell::Cell::new(scale_px(190, dpi)),
+            drop_card_h: std::cell::Cell::new(scale_px(175, dpi)),
             video_card_tools_h: std::cell::Cell::new(scale_px(210, dpi)),
             video_everything_btn_rel_y: std::cell::Cell::new(scale_px(120, dpi)),
+            video_net_sub_rel_y: std::cell::Cell::new(0),
             hover_slider: None,
 
             is_lang_menu_open: false,
             hover_lang_item: None,
+            pressed_lang_item: None,
+            pressed_monitor_dd_item: None,
+            flyout_press_start: None,
             lang_btn_pressed: false,
+            sidebar_collapsed: false,
+            sidebar_anim: 0.0,
+            sidebar_anim_from: 0.0,
+            sidebar_anim_start: None,
+            hamburger_pressed: false,
             lang_menu_anim: 0.0,
             lang_menu_anim_start: None,
             pressed_tab: None,
@@ -1139,6 +1385,11 @@ impl AppState {
             video_params_expand_anim: 0.0,
             video_params_anim_start: None,
             is_video_params_header_hovered: false,
+            is_ev_expanded: false,
+            ev_expand_anim: 0.0,
+            ev_anim_start: None,
+            is_ev_header_hovered: false,
+            video_ev_card_rel_y: std::cell::Cell::new(0),
 
             checkbox_states: std::cell::RefCell::new(HashMap::new()),
             checkbox_anims: std::cell::RefCell::new(HashMap::new()),
@@ -1148,6 +1399,66 @@ impl AppState {
         }
     }
 
+    fn edit_fix(&self, i: usize) -> usize {
+        let mut i = i.min(self.edit_buffer.len());
+        while i > 0 && !self.edit_buffer.is_char_boundary(i) {
+            i -= 1;
+        }
+        i
+    }
+
+    /// Ordered selection range (start, end); equal when there is only a caret.
+    fn edit_sel(&self) -> (usize, usize) {
+        let a = self.edit_fix(self.edit_anchor);
+        let c = self.edit_fix(self.edit_caret);
+        (a.min(c), a.max(c))
+    }
+
+    fn edit_caret_to_end(&mut self) {
+        self.edit_caret = self.edit_buffer.len();
+        self.edit_anchor = self.edit_caret;
+    }
+
+    fn edit_select_all_text(&mut self) {
+        self.edit_anchor = 0;
+        self.edit_caret = self.edit_buffer.len();
+    }
+
+    fn edit_delete_selection(&mut self) -> bool {
+        let (s, e) = self.edit_sel();
+        if s < e {
+            self.edit_buffer.replace_range(s..e, "");
+            self.edit_caret = s;
+            self.edit_anchor = s;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Types `c` at the caret, replacing the selection.
+    fn edit_insert(&mut self, c: char, max_len: usize) {
+        self.edit_delete_selection();
+        let at = self.edit_fix(self.edit_caret);
+        if self.edit_buffer.len() + c.len_utf8() <= max_len {
+            self.edit_buffer.insert(at, c);
+            self.edit_caret = at + c.len_utf8();
+        } else {
+            self.edit_caret = at;
+        }
+        self.edit_anchor = self.edit_caret;
+    }
+
+    unsafe fn toggle_sidebar(&mut self, hwnd: HWND) {
+        self.sidebar_collapsed = !self.sidebar_collapsed;
+        self.sidebar_anim_from = self.sidebar_anim;
+        self.sidebar_anim_start = Some(std::time::Instant::now());
+        self.is_lang_menu_open = false;
+        self.lang_menu_anim_start = None;
+        let _ = SetTimer(hwnd, 1, 16, None);
+        let _ = InvalidateRect(hwnd, None, false);
+    }
+
     fn switch_tab(&mut self, hwnd: HWND, new_tab: ManagerTab) {
         if self.active_tab == new_tab {
             return;
@@ -1155,7 +1466,7 @@ impl AppState {
         if self.active_edit.is_some() || self.has_unapplied_text_edits {
             self.active_edit = None;
             self.edit_buffer.clear();
-            self.edit_select_all = false;
+            self.edit_caret_to_end();
             self.has_unapplied_text_edits = false;
             let def = Settings::default();
             match self.active_tab {
@@ -1185,10 +1496,11 @@ impl AppState {
         self.is_risk_header_hovered = false;
         self.is_sort_header_hovered = false;
         self.is_video_params_header_hovered = false;
+        self.is_ev_header_hovered = false;
         self.active_tab = new_tab;
         self.scroll_y = 0;
         let item_h = scale_px(44, self.dpi) as f32;
-        let start_y = scale_px(85, self.dpi) as f32;
+        let start_y = scale_px(NAV_START_Y, self.dpi) as f32;
         let target_y = start_y + (new_tab.to_index() as f32 * item_h) + (item_h / 2.0);
         self.indicator_from_y = self.indicator_y;
         self.indicator_target_y = target_y;
@@ -1337,6 +1649,21 @@ impl AppState {
             }
         }
 
+        // 1b. Navigation rail collapse / expand (width interpolation, ease-out cubic)
+        if let Some(start_t) = self.sidebar_anim_start {
+            let p = (start_t.elapsed().as_secs_f32() / SIDEBAR_ANIM_SECS).clamp(0.0, 1.0);
+            let target = if self.sidebar_collapsed { 1.0 } else { 0.0 };
+            let t = 1.0 - (1.0 - p).powi(3);
+            self.sidebar_anim = self.sidebar_anim_from + (target - self.sidebar_anim_from) * t;
+            if p < 1.0 {
+                active = true;
+                non_lang_active = true;
+            } else {
+                self.sidebar_anim = target;
+                self.sidebar_anim_start = None;
+            }
+        }
+
         // 2. Page transition animation (Win11 slide up fade-in)
         if let Some(start_t) = self.page_trans_start {
             let elapsed = start_t.elapsed().as_secs_f32();
@@ -1406,6 +1733,14 @@ impl AppState {
             } else {
                 self.lang_menu_anim = 1.0;
                 self.lang_menu_anim_start = None;
+            }
+        }
+
+        // 6a. Flyout item press: selected-indicator squash
+        if let Some(start_t) = self.flyout_press_start {
+            if start_t.elapsed().as_secs_f32() < FLYOUT_PRESS_SECS {
+                active = true;
+                non_lang_active = true;
             }
         }
 
@@ -1502,6 +1837,21 @@ impl AppState {
             } else {
                 self.video_params_expand_anim = target;
                 self.video_params_anim_start = None;
+            }
+        }
+
+        // 9b. Everything expander card
+        if let Some((start_t, target_expanded)) = self.ev_anim_start {
+            let p = (start_t.elapsed().as_secs_f32() / 0.18).clamp(0.0, 1.0);
+            let (from, target) = if target_expanded { (0.0, 1.0) } else { (1.0, 0.0) };
+            if p < 1.0 {
+                active = true;
+                non_lang_active = true;
+                let t = 1.0 - (1.0 - p).powi(3);
+                self.ev_expand_anim = from + (target - from) * t;
+            } else {
+                self.ev_expand_anim = target;
+                self.ev_anim_start = None;
             }
         }
 
@@ -1716,7 +2066,7 @@ fn main() {
     let x = ((screen_w - width) / 2).max(0);
     let y = ((screen_h - height) / 2).max(0);
 
-    let title_w = to_wide(tr("CBX Shell 控制中心", "CBX Shell Control Center"));
+    let title_w = to_wide(window_title());
     let hwnd = unsafe {
         CreateWindowExW(
             Default::default(),
@@ -1746,6 +2096,16 @@ fn main() {
             cyBottomHeight: -1,
         };
         let _ = DwmExtendFrameIntoClientArea(hwnd, &margins);
+        // Re-run WM_NCCALCSIZE so the client area covers the caption (custom title bar).
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            0,
+            0,
+            0,
+            0,
+            SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
 
         let _ = DragAcceptFiles(hwnd, true);
         let _ = ShowWindow(hwnd, SW_SHOW);
@@ -1798,7 +2158,7 @@ unsafe fn commit_active_edit(state: &mut AppState) {
             let trimmed = state.edit_buffer.trim().to_string();
             state.settings.custom_text_extensions = trimmed;
             state.settings.sanitize();
-            state.edit_select_all = false;
+            state.edit_caret_to_end();
             state.edit_buffer.clear();
             state.has_unapplied_text_edits = true;
             return;
@@ -1822,7 +2182,7 @@ unsafe fn commit_active_edit(state: &mut AppState) {
             EditTarget::CustomTextExtensions => {}
         }
         state.settings.sanitize();
-        state.edit_select_all = false;
+        state.edit_caret_to_end();
         state.edit_buffer.clear();
         state.has_unapplied_text_edits = true;
     }
@@ -1834,13 +2194,56 @@ unsafe extern "system" fn wnd_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    // Caption buttons (min / max / close) are drawn and hit-tested by DWM over the extended
+    // frame; give it the first look at every message.
+    let mut dwm_result = LRESULT(0);
+    if DwmDefWindowProc(hwnd, msg, wparam, lparam, &mut dwm_result).as_bool() {
+        return dwm_result;
+    }
     match msg {
+        // Custom title bar: keep the system's left / right / bottom resize borders but let the
+        // client area start at the very top, so the caption strip is painted by us.
+        WM_NCCALCSIZE if wparam.0 != 0 => {
+            let params = &mut *(lparam.0 as *mut NCCALCSIZE_PARAMS);
+            let top = params.rgrc[0].top;
+            let result = DefWindowProcW(hwnd, msg, wparam, lparam);
+            params.rgrc[0].top = top;
+            if IsZoomed(hwnd).as_bool() {
+                // A maximized window hangs its frame off-screen; keep the content on-screen.
+                params.rgrc[0].top += resize_frame_h(hwnd);
+            }
+            result
+        }
+        WM_NCHITTEST => {
+            let hit = DefWindowProcW(hwnd, msg, wparam, lparam);
+            if hit.0 != HTCLIENT {
+                return hit;
+            }
+            let mut pt = POINT {
+                x: (lparam.0 & 0xFFFF) as i16 as i32,
+                y: ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
+            };
+            let _ = windows::Win32::Graphics::Gdi::ScreenToClient(hwnd, &mut pt);
+            if !IsZoomed(hwnd).as_bool() && pt.y < resize_frame_h(hwnd) {
+                return LRESULT(HTTOP);
+            }
+            if pt.y < titlebar_h(hwnd) {
+                return LRESULT(HTCAPTION);
+            }
+            hit
+        }
         WM_CREATE => {
             let _ = ImmAssociateContext(hwnd, 0);
             let dpi = GetDpiForWindow(hwnd);
             let mut app = AppState::new(dpi);
             app.checkbox_anim_hwnd = hwnd;
+            let auto_update_due = app.settings.auto_check_updates
+                && updater::is_configured()
+                && unix_now().saturating_sub(app.settings.last_update_check as u64) >= 86_400;
             state_install(hwnd, app);
+            if auto_update_due {
+                updater::start_check(hwnd.0);
+            }
             let _ = SetTimer(hwnd, 2, 200, None);
             LRESULT(0)
         }
@@ -1871,12 +2274,12 @@ unsafe extern "system" fn wnd_proc(
                     let (still_anim, non_lang_active) = state.step_animations();
                     if was_lang_anim && !non_lang_active && state.expanded_monitor_item.is_none() {
                         let mut rect = RECT::default();
-                        let _ = GetClientRect(hwnd, &mut rect);
+                        let _ = logical_client_rect(hwnd, &mut rect);
                         let sidebar_rect = RECT {
                             left: 0,
                             top: 0,
-                            right: scale_px(SIDEBAR_BASE_WIDTH, state.dpi),
-                            bottom: rect.bottom,
+                            right: lang_invalidate_right(state),
+                            bottom: rect.bottom + titlebar_h(hwnd),
                         };
                         let _ = InvalidateRect(hwnd, Some(&sidebar_rect), false);
                     } else {
@@ -1889,6 +2292,8 @@ unsafe extern "system" fn wnd_proc(
             } else if timer_id == 2 {
                 if let Some(mut state_guard) = state_lock() {
                     let state: &mut AppState = &mut state_guard;
+                    monitor_auto_off_tick(hwnd, state);
+                    prewarm_tick(hwnd, state);
                     let snap = cbx_core::monitor::fetch_snapshot();
                     let changed = match (&state.monitor_snapshot, &snap) {
                         (Some(a), Some(b)) => {
@@ -1916,20 +2321,20 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         WM_MOUSEMOVE => {
-            let x = (lparam.0 & 0xFFFF) as i32;
-            let y = ((lparam.0 >> 16) & 0xFFFF) as i32;
+            let x = (lparam.0 & 0xFFFF) as i16 as i32;
+            let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32 - titlebar_h(hwnd);
             handle_mouse_move(hwnd, x, y);
             LRESULT(0)
         }
         WM_LBUTTONDOWN => {
-            let x = (lparam.0 & 0xFFFF) as i32;
-            let y = ((lparam.0 >> 16) & 0xFFFF) as i32;
+            let x = (lparam.0 & 0xFFFF) as i16 as i32;
+            let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32 - titlebar_h(hwnd);
             handle_mouse_down(hwnd, x, y);
             LRESULT(0)
         }
         WM_LBUTTONUP => {
-            let x = (lparam.0 & 0xFFFF) as i32;
-            let y = ((lparam.0 >> 16) & 0xFFFF) as i32;
+            let x = (lparam.0 & 0xFFFF) as i16 as i32;
+            let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32 - titlebar_h(hwnd);
             handle_mouse_up(hwnd, x, y);
             LRESULT(0)
         }
@@ -1948,7 +2353,7 @@ unsafe extern "system" fn wnd_proc(
                 let state: &AppState = &state_guard;
                 let hover_expander = (state.active_tab == ManagerTab::Archives
                     && (state.is_risk_header_hovered || state.is_sort_header_hovered))
-                    || (state.active_tab == ManagerTab::Video && state.is_video_params_header_hovered);
+                    || (state.active_tab == ManagerTab::Video && (state.is_video_params_header_hovered || state.is_ev_header_hovered));
                 if hover_expander {
                     let cursor = LoadCursorW(None, IDC_HAND).unwrap_or_default();
                     let _ = SetCursor(cursor);
@@ -1958,11 +2363,12 @@ unsafe extern "system" fn wnd_proc(
                     let mut pt = windows::Win32::Foundation::POINT::default();
                     let _ = windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut pt);
                     let _ = windows::Win32::Graphics::Gdi::ScreenToClient(hwnd, &mut pt);
+                    pt.y -= titlebar_h(hwnd);
 
                     let mut rect = RECT::default();
-                    let _ = GetClientRect(hwnd, &mut rect);
+                    let _ = logical_client_rect(hwnd, &mut rect);
                     let win_w = rect.right - rect.left;
-                    let sidebar_w = scale_px(SIDEBAR_BASE_WIDTH, state.dpi);
+                    let sidebar_w = sidebar_width(state);
                     let content_x = sidebar_w + scale_px(25, state.dpi);
                     let content_w = (win_w - content_x - scale_px(30, state.dpi)).max(400);
 
@@ -1984,6 +2390,67 @@ unsafe extern "system" fn wnd_proc(
             }
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
+        WM_KEYDOWN_MSG => {
+            if let Some(mut state_guard) = state_lock() {
+                let state: &mut AppState = &mut state_guard;
+                if state.active_edit.is_some() {
+                    let shift = GetKeyState(0x10) < 0;
+                    let len = state.edit_buffer.len();
+                    let (sel_s, sel_e) = state.edit_sel();
+                    let caret = state.edit_fix(state.edit_caret);
+                    let handled = match wparam.0 as u32 {
+                        0x25 => {
+                            // Left
+                            state.edit_caret = if !shift && sel_s < sel_e { sel_s } else { state.edit_fix(caret.saturating_sub(1)) };
+                            true
+                        }
+                        0x27 => {
+                            // Right
+                            state.edit_caret = if !shift && sel_s < sel_e {
+                                sel_e
+                            } else {
+                                let mut n = (caret + 1).min(len);
+                                while n < len && !state.edit_buffer.is_char_boundary(n) {
+                                    n += 1;
+                                }
+                                n
+                            };
+                            true
+                        }
+                        0x24 => {
+                            state.edit_caret = 0; // Home
+                            true
+                        }
+                        0x23 => {
+                            state.edit_caret = len; // End
+                            true
+                        }
+                        0x2E => {
+                            // Delete: the selection, else the character after the caret
+                            if !state.edit_delete_selection() && caret < len {
+                                let mut n = caret + 1;
+                                while n < len && !state.edit_buffer.is_char_boundary(n) {
+                                    n += 1;
+                                }
+                                state.edit_buffer.replace_range(caret..n, "");
+                                state.edit_caret = caret;
+                            }
+                            state.edit_anchor = state.edit_caret;
+                            true
+                        }
+                        _ => false,
+                    };
+                    if handled {
+                        if !shift {
+                            state.edit_anchor = state.edit_caret;
+                        }
+                        let _ = InvalidateRect(hwnd, None, false);
+                        return LRESULT(0);
+                    }
+                }
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
         WM_CHAR => {
             let ch = (wparam.0 & 0xFFFF) as u16;
             if let Some(mut state_guard) = state_lock() {
@@ -1991,16 +2458,19 @@ unsafe extern "system" fn wnd_proc(
                 if state.active_edit.is_some() {
                     match ch {
                         0x01 => { // Ctrl+A: select all
-                            state.edit_select_all = true;
+                            state.edit_select_all_text();
                             let _ = InvalidateRect(hwnd, None, false);
                             return LRESULT(0);
                         }
-                        0x08 => { // Backspace
-                            if state.edit_select_all {
-                                state.edit_buffer.clear();
-                                state.edit_select_all = false;
-                            } else {
-                                state.edit_buffer.pop();
+                        0x08 => { // Backspace: delete the selection, else the character before the caret
+                            if !state.edit_delete_selection() {
+                                let c = state.edit_fix(state.edit_caret);
+                                if c > 0 {
+                                    let p = state.edit_fix(c - 1);
+                                    state.edit_buffer.replace_range(p..c, "");
+                                    state.edit_caret = p;
+                                    state.edit_anchor = p;
+                                }
                             }
                             let _ = InvalidateRect(hwnd, None, false);
                             return LRESULT(0);
@@ -2019,10 +2489,7 @@ unsafe extern "system" fn wnd_proc(
                         }
                         0x16 => { // Ctrl+V: Paste from clipboard
                             if let Some(clip) = read_clipboard_text(hwnd) {
-                                if state.edit_select_all {
-                                    state.edit_buffer.clear();
-                                    state.edit_select_all = false;
-                                }
+                                state.edit_delete_selection();
                                 let is_custom = state.active_edit == Some(EditTarget::CustomTextExtensions);
                                 let max_len = if is_custom { 64 } else { 4 };
                                 for c in clip.chars() {
@@ -2037,7 +2504,7 @@ unsafe extern "system" fn wnd_proc(
                                         mapped.is_ascii_digit()
                                     };
                                     if ok && state.edit_buffer.len() < max_len {
-                                        state.edit_buffer.push(mapped);
+                                        state.edit_insert(mapped, max_len);
                                     }
                                 }
                                 let _ = InvalidateRect(hwnd, None, false);
@@ -2046,7 +2513,7 @@ unsafe extern "system" fn wnd_proc(
                         }
                         0x1B => { // Esc: Cancel
                             state.active_edit = None;
-                            state.edit_select_all = false;
+                            state.edit_caret_to_end();
                             state.edit_buffer.clear();
                             let _ = InvalidateRect(hwnd, None, false);
                             return LRESULT(0);
@@ -2054,13 +2521,7 @@ unsafe extern "system" fn wnd_proc(
                         0xFF0C | 0x3001 | 0xFF1B | 0x3002 | 0xFF0E => {
                             if state.active_edit == Some(EditTarget::CustomTextExtensions) {
                                 let mapped = if matches!(ch, 0x3002 | 0xFF0E) { '.' } else { ',' };
-                                if state.edit_select_all {
-                                    state.edit_buffer.clear();
-                                    state.edit_select_all = false;
-                                }
-                                if state.edit_buffer.len() < 64 {
-                                    state.edit_buffer.push(mapped);
-                                }
+                                state.edit_insert(mapped, 64);
                                 let _ = InvalidateRect(hwnd, None, false);
                                 return LRESULT(0);
                             }
@@ -2069,24 +2530,12 @@ unsafe extern "system" fn wnd_proc(
                             let c = ch as u8 as char;
                             if state.active_edit == Some(EditTarget::CustomTextExtensions) {
                                 if c.is_ascii_alphanumeric() || matches!(c, ',' | '.' | ' ' | '_' | '-') {
-                                    if state.edit_select_all {
-                                        state.edit_buffer.clear();
-                                        state.edit_select_all = false;
-                                    }
-                                    if state.edit_buffer.len() < 64 {
-                                        state.edit_buffer.push(c);
-                                    }
+                                    state.edit_insert(c, 64);
                                     let _ = InvalidateRect(hwnd, None, false);
                                     return LRESULT(0);
                                 }
                             } else if c.is_ascii_digit() {
-                                if state.edit_select_all {
-                                    state.edit_buffer.clear();
-                                    state.edit_select_all = false;
-                                }
-                                if state.edit_buffer.len() < 4 {
-                                    state.edit_buffer.push(c);
-                                }
+                                state.edit_insert(c, 4);
                                 let _ = InvalidateRect(hwnd, None, false);
                                 return LRESULT(0);
                             }
@@ -2096,6 +2545,16 @@ unsafe extern "system" fn wnd_proc(
                 }
             }
             DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        m if m == updater::WM_APP_UPDATE => {
+            if let Some(mut state) = state_lock() {
+                if updater::take_check_completed() {
+                    state.settings.last_update_check = unix_now().min(u32::MAX as u64) as u32;
+                    let _ = state.settings.save();
+                }
+            }
+            let _ = InvalidateRect(hwnd, None, false);
+            LRESULT(0)
         }
         WM_DESTROY => {
             let _ = KillTimer(hwnd, 2);
@@ -2126,10 +2585,19 @@ unsafe fn handle_mouse_move(hwnd: HWND, x: i32, y: i32) {
 
     let prev_mouse = state.mouse_pos;
     state.mouse_pos = (x, y);
+    if state.edit_dragging {
+        let geom = state.active_edit.and_then(|t| state.edit_boxes.borrow().iter().copied().find(|g| g.target == t));
+        if let Some(g) = geom {
+            let text = state.edit_buffer.clone();
+            state.edit_caret = edit_hit_index(hwnd, &g, &text, x);
+            let _ = InvalidateRect(hwnd, None, false);
+        }
+        return;
+    }
 
     if state.is_dragging_scrollbar {
         let mut rect = RECT::default();
-        let _ = GetClientRect(hwnd, &mut rect);
+        let _ = logical_client_rect(hwnd, &mut rect);
         let win_h = rect.bottom - rect.top;
         let (_, _, _, scrollable_track) = get_scrollbar_metrics(state, win_h);
         let dy = y - state.drag_scrollbar_start_y;
@@ -2154,63 +2622,24 @@ unsafe fn handle_mouse_move(hwnd: HWND, x: i32, y: i32) {
         return;
     }
 
-    let sidebar_w = scale_px(SIDEBAR_BASE_WIDTH, state.dpi);
+    let sidebar_w = sidebar_width(state);
     let mut need_repaint = false;
 
     if state.is_lang_menu_open {
         let mut rect = RECT::default();
-        let _ = GetClientRect(hwnd, &mut rect);
+        let _ = logical_client_rect(hwnd, &mut rect);
         let win_h = rect.bottom - rect.top;
-        let lang_y = win_h - scale_px(50, state.dpi);
-        let lang_x = scale_px(16, state.dpi);
-        let lang_w = sidebar_w - scale_px(32, state.dpi);
-        let lang_h = scale_px(32, state.dpi);
-        let btn_bottom = lang_y + lang_h;
-        let item_h = scale_px(36, state.dpi);
-        let padding = scale_px(4, state.dpi);
-        let menu_w = lang_w;
-        let full_menu_h = (AVAILABLE_LOCALES.len() as i32 * item_h) + padding * 2;
-        let anim_val = if state.lang_menu_anim_start.is_some() { state.lang_menu_anim } else { 1.0 };
-        let current_h = lang_h + (((full_menu_h - lang_h) as f32) * anim_val) as i32;
-        let current_top = btn_bottom - current_h;
-
-        let mut new_lang_hover = None;
-        if x >= lang_x && x <= lang_x + menu_w && y >= current_top && y <= btn_bottom {
-            let relative_y = y - current_top - padding;
-            if relative_y >= 0 {
-                let idx = (relative_y / item_h) as usize;
-                if idx < AVAILABLE_LOCALES.len() {
-                    new_lang_hover = Some(idx);
-                }
-            }
-        }
+        let new_lang_hover = lang_flyout_geom(state, win_h).item_at(x, y);
         if state.hover_lang_item != new_lang_hover {
             state.hover_lang_item = new_lang_hover;
             need_repaint = true;
         }
     }
 
-    if let Some(dd_kind) = state.open_monitor_dropdown {
-        let (pipe_x, status_x, btn_y, _btn_h) = state.monitor_dropdown_anchor.get();
-        let (menu_x, menu_w, count) = if dd_kind == 0 {
-            (pipe_x, scale_px(114, state.dpi), 5usize)
-        } else {
-            (status_x, scale_px(108, state.dpi), 4usize)
-        };
-        let item_h = scale_px(26, state.dpi);
-        let padding = scale_px(4, state.dpi);
-        let menu_top = btn_y;
-        let menu_h = (count as i32 * item_h) + padding * 2;
-        let mut new_hover = None;
-        if x >= menu_x && x <= menu_x + menu_w && y >= menu_top && y <= menu_top + menu_h {
-            let rel_y = y - menu_top - padding;
-            if rel_y >= 0 {
-                let idx = (rel_y / item_h) as usize;
-                if idx < count {
-                    new_hover = Some(idx);
-                }
-            }
-        }
+    if state.open_monitor_dropdown.is_some() {
+        let mut rect = RECT::default();
+        let _ = logical_client_rect(hwnd, &mut rect);
+        let new_hover = monitor_flyout_geom(state, rect.bottom - rect.top).and_then(|g| g.item_at(x, y));
         if state.hover_monitor_dropdown_item != new_hover {
             state.hover_monitor_dropdown_item = new_hover;
             need_repaint = true;
@@ -2221,13 +2650,14 @@ unsafe fn handle_mouse_move(hwnd: HWND, x: i32, y: i32) {
     let mut new_sort_hover = false;
     let mut new_risk_hover = false;
     let mut new_video_params_hover = false;
+    let mut new_ev_hover = false;
     if state.expanded_monitor_item.is_none()
         && !state.is_lang_menu_open
         && state.open_monitor_dropdown.is_none()
     {
         if state.active_tab == ManagerTab::Archives || state.active_tab == ManagerTab::Video {
             let mut rect = RECT::default();
-            let _ = GetClientRect(hwnd, &mut rect);
+            let _ = logical_client_rect(hwnd, &mut rect);
             let win_w = rect.right - rect.left;
             let content_x = sidebar_w + scale_px(25, state.dpi);
             let content_w = (win_w - content_x - scale_px(30, state.dpi)).max(400);
@@ -2275,6 +2705,10 @@ unsafe fn handle_mouse_move(hwnd: HWND, x: i32, y: i32) {
                 if x >= content_x && x <= content_x + content_w && content_y >= card4_y && content_y <= card4_y + header_h {
                     new_video_params_hover = true;
                 }
+                let ev_y = card_tools_y + state.video_ev_card_rel_y.get();
+                if state.video_ev_card_rel_y.get() > 0 && x >= content_x && x <= content_x + content_w && content_y >= ev_y && content_y <= ev_y + header_h {
+                    new_ev_hover = true;
+                }
             }
         }
     }
@@ -2290,11 +2724,16 @@ unsafe fn handle_mouse_move(hwnd: HWND, x: i32, y: i32) {
         state.is_video_params_header_hovered = new_video_params_hover;
         need_repaint = true;
     }
+    if state.is_ev_header_hovered != new_ev_hover {
+        state.is_ev_header_hovered = new_ev_hover;
+        need_repaint = true;
+    }
 
     let mut new_hover = None;
     if x < sidebar_w {
         let item_h = scale_px(44, state.dpi);
-        let start_y = scale_px(90, state.dpi);
+        // Same origin as rendering/clicks (was 90 px, 5 px off from the drawn pills).
+        let start_y = scale_px(NAV_START_Y, state.dpi);
         for i in 0..7 {
             let iy = start_y + (i as i32 * item_h);
             if y >= iy && y < iy + item_h {
@@ -2330,7 +2769,7 @@ unsafe fn handle_mouse_down(hwnd: HWND, x: i32, y: i32) {
     let state: &mut AppState = &mut state_guard;
 
     let mut rect = RECT::default();
-    let _ = GetClientRect(hwnd, &mut rect);
+    let _ = logical_client_rect(hwnd, &mut rect);
     let win_w = rect.right - rect.left;
     let win_h = rect.bottom - rect.top;
 
@@ -2410,91 +2849,32 @@ unsafe fn handle_mouse_down(hwnd: HWND, x: i32, y: i32) {
         return;
     }
 
-    let sidebar_w = scale_px(SIDEBAR_BASE_WIDTH, state.dpi);
+    let sidebar_w = sidebar_width(state);
 
-    // If language flyout is open, check flyout item click or outside click
+    // If language flyout is open: press an item (applied on release) or close on outside click
     if state.is_lang_menu_open {
-        let lang_y = win_h - scale_px(50, state.dpi);
-        let lang_x = scale_px(16, state.dpi);
-        let lang_w = sidebar_w - scale_px(32, state.dpi);
-        let lang_h = scale_px(32, state.dpi);
-        let btn_bottom = lang_y + lang_h;
-        let item_h = scale_px(36, state.dpi);
-        let padding = scale_px(4, state.dpi);
-        let menu_w = lang_w;
-        let full_menu_h = (AVAILABLE_LOCALES.len() as i32 * item_h) + padding * 2;
-        let menu_top = btn_bottom - full_menu_h;
-
-        // Click inside menu items
-        if x >= lang_x && x <= lang_x + menu_w && y >= menu_top && y <= btn_bottom {
-            let relative_y = y - menu_top - padding;
-            if relative_y >= 0 {
-                let clicked_idx = (relative_y / item_h) as usize;
-                if clicked_idx < AVAILABLE_LOCALES.len() {
-                    let loc = &AVAILABLE_LOCALES[clicked_idx];
-                    set_current_lang(loc.lang);
-                    loc.lang.save();
-                    state.cache_status_msg = state.get_cache_status_display();
-                    state.test_metrics_str = state.get_test_metrics_display();
-                    state.is_lang_menu_open = false;
-                    state.lang_menu_anim_start = None;
-                    let _ = InvalidateRect(hwnd, None, false);
-                    return;
-                }
-            }
+        if let Some(idx) = lang_flyout_geom(state, win_h).item_at(x, y) {
+            state.pressed_lang_item = Some(idx);
+            state.flyout_press_start = Some(std::time::Instant::now());
+            let _ = SetTimer(hwnd, 1, 10, None);
+            let _ = InvalidateRect(hwnd, None, false);
+            return;
         }
-
-        // Outside click closes the menu
         state.is_lang_menu_open = false;
         state.lang_menu_anim_start = None;
         let _ = InvalidateRect(hwnd, None, false);
         return;
     }
 
-    // If monitor filter dropdown flyout is open, handle item click or outside click
-    if let Some(dd_kind) = state.open_monitor_dropdown {
-        let (pipe_x, status_x, btn_y, _btn_h) = state.monitor_dropdown_anchor.get();
-        let (menu_x, menu_w, count) = if dd_kind == 0 {
-            (pipe_x, scale_px(114, state.dpi), 5usize)
-        } else {
-            (status_x, scale_px(108, state.dpi), 4usize)
-        };
-        let item_h = scale_px(26, state.dpi);
-        let padding = scale_px(4, state.dpi);
-        let menu_top = btn_y;
-        let menu_h = (count as i32 * item_h) + padding * 2;
-
-        if x >= menu_x && x <= menu_x + menu_w && y >= menu_top && y <= menu_top + menu_h {
-            let rel_y = y - menu_top - padding;
-            if rel_y >= 0 {
-                let idx = (rel_y / item_h) as usize;
-                if idx < count {
-                    if dd_kind == 0 {
-                        state.monitor_pipeline_filter = match idx {
-                            1 => MonitorPipelineFilter::DirectFile,
-                            2 => MonitorPipelineFilter::IpcHit,
-                            3 => MonitorPipelineFilter::SearchHit,
-                            4 => MonitorPipelineFilter::StreamRpc,
-                            _ => MonitorPipelineFilter::All,
-                        };
-                    } else {
-                        state.monitor_filter = match idx {
-                            1 => MonitorFilter::Success,
-                            2 => MonitorFilter::Slow,
-                            3 => MonitorFilter::InterruptedOrSkipped,
-                            _ => MonitorFilter::All,
-                        };
-                    }
-                    state.monitor_scroll = 0;
-                    state.open_monitor_dropdown = None;
-                    state.monitor_dd_anim_start = None;
-                    state.hover_monitor_dropdown_item = None;
-                    let _ = InvalidateRect(hwnd, None, false);
-                    return;
-                }
-            }
+    // If a monitor filter flyout is open: press an item (applied on release) or close on outside click
+    if state.open_monitor_dropdown.is_some() {
+        if let Some(idx) = monitor_flyout_geom(state, win_h).and_then(|g| g.item_at(x, y)) {
+            state.pressed_monitor_dd_item = Some(idx);
+            state.flyout_press_start = Some(std::time::Instant::now());
+            let _ = SetTimer(hwnd, 1, 10, None);
+            let _ = InvalidateRect(hwnd, None, false);
+            return;
         }
-
         state.open_monitor_dropdown = None;
         state.monitor_dd_anim_start = None;
         state.hover_monitor_dropdown_item = None;
@@ -2502,12 +2882,68 @@ unsafe fn handle_mouse_down(hwnd: HWND, x: i32, y: i32) {
         return;
     }
 
+    // Clear button of the focused text box (acts on release)
+    if state.active_edit.is_some() {
+        if let Some(rc) = state.edit_clear_rect.get() {
+            if x >= rc.left && x < rc.right && y >= rc.top && y < rc.bottom {
+                state.edit_clear_pressed = true;
+                let _ = InvalidateRect(hwnd, None, false);
+                return;
+            }
+        }
+    }
+
+    // Text boxes: focus, place the caret under the pointer and start a drag selection
+    let hit_box = state
+        .edit_boxes
+        .borrow()
+        .iter()
+        .copied()
+        .find(|g| x >= g.rect.left && x < g.rect.right && y >= g.rect.top && y < g.rect.bottom);
+    if let Some(g) = hit_box {
+        if state.active_edit != Some(g.target) {
+            commit_active_edit(state);
+            state.active_edit = Some(g.target);
+            state.edit_buffer = edit_value_string(state, g.target);
+        }
+        let text = state.edit_buffer.clone();
+        let idx = edit_hit_index(hwnd, &g, &text, x);
+        state.edit_caret = idx;
+        state.edit_anchor = idx;
+        state.edit_dragging = true;
+        SetCapture(hwnd);
+        let _ = InvalidateRect(hwnd, None, false);
+        return;
+    }
+
+    // Clicking anywhere else ends text editing (Win11 TextBox loses focus), except the unit
+    // label and the − / + spin buttons on the same row, which keep editing the value.
+    if let Some(target) = state.active_edit {
+        let geom = state.edit_boxes.borrow().iter().copied().find(|g| g.target == target);
+        let on_own_row = geom.is_some_and(|g| {
+            y >= g.rect.top && y < g.rect.bottom && x >= g.rect.left && x < g.rect.right + scale_px(110, state.dpi)
+        });
+        if !on_own_row {
+            commit_active_edit(state);
+            state.edit_dragging = false;
+            let _ = InvalidateRect(hwnd, None, false);
+            // fall through: the click still reaches whatever is under the pointer
+        }
+    }
+
+    // Rail toggle button (press here, toggle on release)
+    let hb = hamburger_rect(state);
+    if x >= hb.left && x < hb.right && y >= hb.top && y < hb.bottom {
+        state.hamburger_pressed = true;
+        let _ = InvalidateRect(hwnd, None, false);
+        return;
+    }
+
     // Sidebar tab clicks
     if x < sidebar_w {
         let lang_y = win_h - scale_px(50, state.dpi);
-        let lang_x = scale_px(16, state.dpi);
-        let lang_w = sidebar_w - scale_px(32, state.dpi);
-        let lang_h = scale_px(32, state.dpi);
+        let (lang_x, lang_w, _) = lang_button_geom(state, sidebar_w);
+        let lang_h = scale_px(LANG_BTN_H, state.dpi);
 
         // Press down on language button: micro-move arrow, defer menu trigger to mouse up
         if x >= lang_x && x <= lang_x + lang_w && y >= lang_y && y <= lang_y + lang_h {
@@ -2518,7 +2954,7 @@ unsafe fn handle_mouse_down(hwnd: HWND, x: i32, y: i32) {
         }
 
         let item_h = scale_px(44, state.dpi);
-        let start_y = scale_px(85, state.dpi);
+        let start_y = scale_px(NAV_START_Y, state.dpi);
         for i in 0..7 {
             let iy = start_y + (i as i32 * item_h);
             if y >= iy && y < iy + item_h {
@@ -2564,6 +3000,58 @@ unsafe fn handle_mouse_down(hwnd: HWND, x: i32, y: i32) {
 unsafe fn handle_mouse_up(hwnd: HWND, x: i32, y: i32) {
     if let Some(mut state_guard) = state_lock() {
         let state: &mut AppState = &mut state_guard;
+        if state.edit_dragging {
+            state.edit_dragging = false;
+            let _ = ReleaseCapture();
+            let _ = InvalidateRect(hwnd, None, false);
+            return;
+        }
+        if state.edit_clear_pressed {
+            state.edit_clear_pressed = false;
+            if let Some(rc) = state.edit_clear_rect.get() {
+                if x >= rc.left && x < rc.right && y >= rc.top && y < rc.bottom {
+                    clear_active_edit_to_default(state);
+                }
+            }
+            let _ = InvalidateRect(hwnd, None, false);
+            return;
+        }
+        if state.pressed_lang_item.is_some() || state.pressed_monitor_dd_item.is_some() {
+            let mut rect = RECT::default();
+            let _ = logical_client_rect(hwnd, &mut rect);
+            let win_h = rect.bottom - rect.top;
+            state.flyout_press_start = None;
+            if let Some(idx) = state.pressed_lang_item.take() {
+                if state.is_lang_menu_open && lang_flyout_geom(state, win_h).item_at(x, y) == Some(idx) {
+                    apply_language_choice(hwnd, state, idx);
+                    state.is_lang_menu_open = false;
+                    state.lang_menu_anim_start = None;
+                    state.hover_lang_item = None;
+                }
+            }
+            if let Some(idx) = state.pressed_monitor_dd_item.take() {
+                if let Some(kind) = state.open_monitor_dropdown {
+                    if monitor_flyout_geom(state, win_h).and_then(|g| g.item_at(x, y)) == Some(idx) {
+                        apply_monitor_filter_choice(state, kind, idx);
+                        state.open_monitor_dropdown = None;
+                        state.monitor_dd_anim_start = None;
+                        state.hover_monitor_dropdown_item = None;
+                    }
+                }
+            }
+            let _ = InvalidateRect(hwnd, None, false);
+            return;
+        }
+        if state.hamburger_pressed {
+            state.hamburger_pressed = false;
+            let hb = hamburger_rect(state);
+            if x >= hb.left && x < hb.right && y >= hb.top && y < hb.bottom {
+                state.toggle_sidebar(hwnd);
+            } else {
+                let _ = InvalidateRect(hwnd, None, false);
+            }
+            return;
+        }
         if let Some(exp_id) = state.pressed_expander.take() {
             state.pressed_expander_anim_start = None;
             state.pressed_expander_anim = 0.0;
@@ -2571,6 +3059,7 @@ unsafe fn handle_mouse_up(hwnd: HWND, x: i32, y: i32) {
                 0 => state.active_tab == ManagerTab::Archives && state.is_sort_header_hovered,
                 1 => state.active_tab == ManagerTab::Archives && state.is_risk_header_hovered,
                 2 => state.active_tab == ManagerTab::Video && state.is_video_params_header_hovered,
+                3 => state.active_tab == ManagerTab::Video && state.is_ev_header_hovered,
                 _ => false,
             };
             if still_over {
@@ -2587,6 +3076,10 @@ unsafe fn handle_mouse_up(hwnd: HWND, x: i32, y: i32) {
                         state.is_video_params_expanded = !state.is_video_params_expanded;
                         state.video_params_anim_start = Some((std::time::Instant::now(), state.is_video_params_expanded));
                     }
+                    3 => {
+                        state.is_ev_expanded = !state.is_ev_expanded;
+                        state.ev_anim_start = Some((std::time::Instant::now(), state.is_ev_expanded));
+                    }
                     _ => {}
                 }
                 let _ = SetTimer(hwnd, 1, 16, None);
@@ -2596,9 +3089,9 @@ unsafe fn handle_mouse_up(hwnd: HWND, x: i32, y: i32) {
         if let Some(pt) = state.pressed_tab.take() {
             state.pressed_tab_anim_start = None;
             state.pressed_tab_anim = 0.0;
-            let sidebar_w = scale_px(SIDEBAR_BASE_WIDTH, state.dpi);
+            let sidebar_w = sidebar_width(state);
             let item_h = scale_px(44, state.dpi);
-            let start_y = scale_px(85, state.dpi);
+            let start_y = scale_px(NAV_START_Y, state.dpi);
             let iy = start_y + (pt as i32 * item_h);
             if x >= 0 && x < sidebar_w && y >= iy && y < iy + item_h {
                 state.switch_tab(hwnd, ManagerTab::from_index(pt));
@@ -2609,13 +3102,12 @@ unsafe fn handle_mouse_up(hwnd: HWND, x: i32, y: i32) {
         if state.lang_btn_pressed {
             state.lang_btn_pressed = false;
             let mut rect = RECT::default();
-            let _ = GetClientRect(hwnd, &mut rect);
+            let _ = logical_client_rect(hwnd, &mut rect);
             let win_h = rect.bottom - rect.top;
-            let sidebar_w = scale_px(SIDEBAR_BASE_WIDTH, state.dpi);
+            let sidebar_w = sidebar_width(state);
             let lang_y = win_h - scale_px(50, state.dpi);
-            let lang_x = scale_px(16, state.dpi);
-            let lang_w = sidebar_w - scale_px(32, state.dpi);
-            let lang_h = scale_px(32, state.dpi);
+            let (lang_x, lang_w, _) = lang_button_geom(state, sidebar_w);
+            let lang_h = scale_px(LANG_BTN_H, state.dpi);
 
             // On mouse up over button: open the flyout menu with accelerated upward extend animation
             if x >= lang_x && x <= lang_x + lang_w && y >= lang_y && y <= lang_y + lang_h {
@@ -2627,8 +3119,8 @@ unsafe fn handle_mouse_up(hwnd: HWND, x: i32, y: i32) {
             let sidebar_rect = RECT {
                 left: 0,
                 top: 0,
-                right: sidebar_w,
-                bottom: win_h,
+                right: lang_invalidate_right(state),
+                bottom: win_h + titlebar_h(hwnd),
             };
             let _ = InvalidateRect(hwnd, Some(&sidebar_rect), false);
         }
@@ -2668,8 +3160,9 @@ unsafe fn handle_mouse_up(hwnd: HWND, x: i32, y: i32) {
 }
 
 unsafe fn update_slider_value(state: &mut AppState, slider_idx: usize, mouse_x: i32) {
-    let sidebar_w = scale_px(SIDEBAR_BASE_WIDTH, state.dpi);
-    let content_x = sidebar_w + scale_px(25, state.dpi);
+    let sidebar_w = sidebar_width(state);
+    // All draggable sliders sit inside the video-parameters expander body (inset rows).
+    let content_x = sidebar_w + scale_px(25, state.dpi) + scale_px(EXPANDER_CONTENT_INDENT, state.dpi);
     let track_x = content_x + scale_px(250, state.dpi);
     let track_w = scale_px(180, state.dpi);
 
@@ -2756,13 +3249,19 @@ fn calculate_content_height(state: &AppState) -> i32 {
             let user_h = state.monitor_card_h;
             let anim = state.monitor_expand_anim;
             let card2_h = header_h + (((user_h - header_h) as f32) * anim) as i32;
-            let card3_h = scale_px(175, dpi);
+            let card3_h = state.drop_card_h.get().max(scale_px(175, dpi));
             scale_px(75, dpi) + offset_banner + card1_h + scale_px(16, dpi) + card2_h + scale_px(16, dpi) + card3_h + scale_px(40, dpi)
         }
         ManagerTab::About => {
             let card1_h = state.about_card1_h.get();
             let card2_h = scale_px(390, dpi);
-            scale_px(75, dpi) + card1_h + scale_px(16, dpi) + card2_h + scale_px(40, dpi)
+            scale_px(75, dpi)
+                + card1_h
+                + scale_px(14, dpi)
+                + about_update_card_h(dpi)
+                + scale_px(16, dpi)
+                + card2_h
+                + scale_px(40, dpi)
         }
     }
 }
@@ -2781,10 +3280,10 @@ fn get_scrollbar_metrics(state: &AppState, win_h: i32) -> (i32, i32, i32, i32) {
 
 unsafe fn handle_content_click(hwnd: HWND, state: &mut AppState, x: i32, y: i32) {
     let y = y + state.scroll_y;
-    let sidebar_w = scale_px(SIDEBAR_BASE_WIDTH, state.dpi);
+    let sidebar_w = sidebar_width(state);
     let content_x = sidebar_w + scale_px(25, state.dpi);
     let mut rect = RECT::default();
-    let _ = GetClientRect(hwnd, &mut rect);
+    let _ = logical_client_rect(hwnd, &mut rect);
     let win_w = rect.right - rect.left;
     let content_w = (win_w - content_x - scale_px(30, state.dpi)).max(400);
 
@@ -3030,18 +3529,45 @@ unsafe fn handle_content_click(hwnd: HWND, state: &mut AppState, x: i32, y: i32)
                 }
             }
 
-            let btn_rf_w = scale_px(100, state.dpi);
-            let btn_rf_y = card_tools_y + if state.video_everything_btn_rel_y.get() > 0 {
-                state.video_everything_btn_rel_y.get()
-            } else {
-                scale_px(120, state.dpi)
-            };
-            let btn_rf_x = content_x + content_w - scale_px(16, state.dpi) - btn_rf_w;
-            if y >= btn_rf_y && y <= btn_rf_y + btn_h && x >= btn_rf_x && x <= btn_rf_x + btn_rf_w {
-                state.trigger_button_anim(hwnd, 342, false);
-                *state.cached_everything_version.borrow_mut() = None;
-                let _ = InvalidateRect(hwnd, None, false);
-                return;
+            // Everything expander card (below the FFmpeg card)
+            let ev_rel = state.video_ev_card_rel_y.get();
+            if ev_rel > 0 {
+                let ev_card_y = card_tools_y + ev_rel;
+                let ev_header_h = scale_px(52, state.dpi);
+                let btn_rf_w = scale_px(100, state.dpi);
+                let btn_rf_h = scale_px(26, state.dpi);
+                let btn_rf_y = card_tools_y + state.video_everything_btn_rel_y.get();
+                let chevron_x = content_x + content_w - scale_px(22, state.dpi) - scale_px(16, state.dpi);
+                let btn_rf_x = chevron_x - btn_rf_w - scale_px(14, state.dpi);
+                if y >= btn_rf_y && y <= btn_rf_y + btn_rf_h && x >= btn_rf_x && x <= btn_rf_x + btn_rf_w {
+                    state.trigger_button_anim(hwnd, 342, false);
+                    *state.cached_everything_version.borrow_mut() = None;
+                    let _ = InvalidateRect(hwnd, None, false);
+                    return;
+                }
+                if x >= content_x && x <= content_x + content_w && y >= ev_card_y && y <= ev_card_y + ev_header_h {
+                    state.pressed_expander = Some(3);
+                    state.pressed_expander_anim = 0.0;
+                    state.pressed_expander_anim_start = Some(std::time::Instant::now());
+                    let _ = SetTimer(hwnd, 1, 16, None);
+                    let _ = InvalidateRect(hwnd, None, false);
+                    return;
+                }
+                let indent = scale_px(EXPANDER_CONTENT_INDENT, state.dpi);
+                if state.is_ev_expanded
+                    && state.ev_expand_anim > 0.5
+                    && handle_net_share_click(
+                        hwnd,
+                        state,
+                        content_x + indent,
+                        card_tools_y + state.video_net_sub_rel_y.get(),
+                        content_w - indent * 2,
+                        x,
+                        y,
+                    )
+                {
+                    return;
+                }
             }
 
             // Card 3: Border preview click (card height is 130px, corner badge removed)
@@ -3100,7 +3626,7 @@ unsafe fn handle_content_click(hwnd: HWND, state: &mut AppState, x: i32, y: i32)
             if state.settings.custom_video_settings && x >= reset_x && x <= reset_x + reset_w && y >= reset_y && y <= reset_y + reset_h {
                 state.trigger_button_anim(hwnd, 303, false);
                 state.active_edit = None;
-                state.edit_select_all = false;
+                state.edit_caret_to_end();
                 state.edit_buffer.clear();
                 state.has_unapplied_text_edits = false;
                 state.settings.position_seek = 25;
@@ -3148,9 +3674,13 @@ unsafe fn handle_content_click(hwnd: HWND, state: &mut AppState, x: i32, y: i32)
 
             let is_custom = state.settings.custom_video_settings;
             let body_switch_w = scale_px(42, state.dpi);
-            let body_switch_x = content_x + content_w - scale_px(40, state.dpi) - scale_px(52, state.dpi) - scale_px(1, state.dpi);
 
             if state.is_video_params_expanded && state.video_params_expand_anim > 0.5 {
+            // Same inset as `render_video_page` uses for the expander body.
+            let indent = scale_px(EXPANDER_CONTENT_INDENT, state.dpi);
+            let content_x = content_x + indent;
+            let content_w = content_w - indent * 2;
+            let body_switch_x = content_x + content_w - scale_px(40, state.dpi) - scale_px(52, state.dpi) - scale_px(1, state.dpi);
             // Section 1: Frame selection policy
             let div1_y = card4_y + scale_px(52, state.dpi);
             let mut c1_y = div1_y + scale_px(10, state.dpi);
@@ -3209,10 +3739,15 @@ unsafe fn handle_content_click(hwnd: HWND, state: &mut AppState, x: i32, y: i32)
             let btn1_y = box1_y + (box_h - btn_sz) / 2;
             if is_custom && state.settings.seek_mode != 0 {
                 if y >= box1_y && y <= box1_y + box_h && x >= box_x && x <= box_x + box_w {
-                    commit_active_edit(state);
-                    state.active_edit = Some(EditTarget::SeekFixedSec);
-                    state.edit_buffer = state.settings.seek_fixed_sec.to_string();
-                    state.edit_select_all = true;
+                    if state.active_edit == Some(EditTarget::SeekFixedSec) {
+                        // Second click on the focused box: drop the selection, keep the caret.
+                        state.edit_caret_to_end();
+                    } else {
+                        commit_active_edit(state);
+                        state.active_edit = Some(EditTarget::SeekFixedSec);
+                        state.edit_buffer = state.settings.seek_fixed_sec.to_string();
+                        state.edit_select_all_text();
+                    }
                     let _ = InvalidateRect(hwnd, None, false);
                     return;
                 } else if y >= btn1_y && y <= btn1_y + btn_sz {
@@ -3221,7 +3756,7 @@ unsafe fn handle_content_click(hwnd: HWND, state: &mut AppState, x: i32, y: i32)
                         state.settings.seek_fixed_sec = state.settings.seek_fixed_sec.saturating_sub(10).max(5);
                         if state.active_edit == Some(EditTarget::SeekFixedSec) {
                             state.edit_buffer = state.settings.seek_fixed_sec.to_string();
-                            state.edit_select_all = false;
+                            state.edit_caret_to_end();
                         }
                         let _ = state.settings.save();
                         let _ = InvalidateRect(hwnd, None, false);
@@ -3231,7 +3766,7 @@ unsafe fn handle_content_click(hwnd: HWND, state: &mut AppState, x: i32, y: i32)
                         state.settings.seek_fixed_sec = (state.settings.seek_fixed_sec + 10).min(1800);
                         if state.active_edit == Some(EditTarget::SeekFixedSec) {
                             state.edit_buffer = state.settings.seek_fixed_sec.to_string();
-                            state.edit_select_all = false;
+                            state.edit_caret_to_end();
                         }
                         let _ = state.settings.save();
                         let _ = InvalidateRect(hwnd, None, false);
@@ -3246,10 +3781,15 @@ unsafe fn handle_content_click(hwnd: HWND, state: &mut AppState, x: i32, y: i32)
             let btn2_y = box2_y + (box_h - btn_sz) / 2;
             if is_custom && state.settings.seek_mode == 2 {
                 if y >= box2_y && y <= box2_y + box_h && x >= box_x && x <= box_x + box_w {
-                    commit_active_edit(state);
-                    state.active_edit = Some(EditTarget::SeekThresholdMin);
-                    state.edit_buffer = state.settings.seek_threshold_min.to_string();
-                    state.edit_select_all = true;
+                    if state.active_edit == Some(EditTarget::SeekThresholdMin) {
+                        // Second click on the focused box: drop the selection, keep the caret.
+                        state.edit_caret_to_end();
+                    } else {
+                        commit_active_edit(state);
+                        state.active_edit = Some(EditTarget::SeekThresholdMin);
+                        state.edit_buffer = state.settings.seek_threshold_min.to_string();
+                        state.edit_select_all_text();
+                    }
                     let _ = InvalidateRect(hwnd, None, false);
                     return;
                 } else if y >= btn2_y && y <= btn2_y + btn_sz {
@@ -3258,7 +3798,7 @@ unsafe fn handle_content_click(hwnd: HWND, state: &mut AppState, x: i32, y: i32)
                         state.settings.seek_threshold_min = state.settings.seek_threshold_min.saturating_sub(5).max(5);
                         if state.active_edit == Some(EditTarget::SeekThresholdMin) {
                             state.edit_buffer = state.settings.seek_threshold_min.to_string();
-                            state.edit_select_all = false;
+                            state.edit_caret_to_end();
                         }
                         let _ = state.settings.save();
                         let _ = InvalidateRect(hwnd, None, false);
@@ -3268,7 +3808,7 @@ unsafe fn handle_content_click(hwnd: HWND, state: &mut AppState, x: i32, y: i32)
                         state.settings.seek_threshold_min = (state.settings.seek_threshold_min + 5).min(300);
                         if state.active_edit == Some(EditTarget::SeekThresholdMin) {
                             state.edit_buffer = state.settings.seek_threshold_min.to_string();
-                            state.edit_select_all = false;
+                            state.edit_caret_to_end();
                         }
                         let _ = state.settings.save();
                         let _ = InvalidateRect(hwnd, None, false);
@@ -3283,10 +3823,15 @@ unsafe fn handle_content_click(hwnd: HWND, state: &mut AppState, x: i32, y: i32)
             let btn_step_y = box_step_y + (box_h - btn_sz) / 2;
             if is_custom {
                 if y >= box_step_y && y <= box_step_y + box_h && x >= box_x && x <= box_x + box_w {
-                    commit_active_edit(state);
-                    state.active_edit = Some(EditTarget::StepProbeSec);
-                    state.edit_buffer = state.settings.step_probe_sec.to_string();
-                    state.edit_select_all = true;
+                    if state.active_edit == Some(EditTarget::StepProbeSec) {
+                        // Second click on the focused box: drop the selection, keep the caret.
+                        state.edit_caret_to_end();
+                    } else {
+                        commit_active_edit(state);
+                        state.active_edit = Some(EditTarget::StepProbeSec);
+                        state.edit_buffer = state.settings.step_probe_sec.to_string();
+                        state.edit_select_all_text();
+                    }
                     let _ = InvalidateRect(hwnd, None, false);
                     return;
                 } else if y >= btn_step_y && y <= btn_step_y + btn_sz {
@@ -3295,7 +3840,7 @@ unsafe fn handle_content_click(hwnd: HWND, state: &mut AppState, x: i32, y: i32)
                         state.settings.step_probe_sec = state.settings.step_probe_sec.saturating_sub(1).max(1);
                         if state.active_edit == Some(EditTarget::StepProbeSec) {
                             state.edit_buffer = state.settings.step_probe_sec.to_string();
-                            state.edit_select_all = false;
+                            state.edit_caret_to_end();
                         }
                         let _ = state.settings.save();
                         let _ = InvalidateRect(hwnd, None, false);
@@ -3305,7 +3850,7 @@ unsafe fn handle_content_click(hwnd: HWND, state: &mut AppState, x: i32, y: i32)
                         state.settings.step_probe_sec = (state.settings.step_probe_sec + 1).min(60);
                         if state.active_edit == Some(EditTarget::StepProbeSec) {
                             state.edit_buffer = state.settings.step_probe_sec.to_string();
-                            state.edit_select_all = false;
+                            state.edit_caret_to_end();
                         }
                         let _ = state.settings.save();
                         let _ = InvalidateRect(hwnd, None, false);
@@ -3320,10 +3865,15 @@ unsafe fn handle_content_click(hwnd: HWND, state: &mut AppState, x: i32, y: i32)
             let btn_gop_y = box_gop_y + (box_h - btn_sz) / 2;
             if is_custom {
                 if y >= box_gop_y && y <= box_gop_y + box_h && x >= box_x && x <= box_x + box_w {
-                    commit_active_edit(state);
-                    state.active_edit = Some(EditTarget::MaxGopHops);
-                    state.edit_buffer = state.settings.max_gop_hops.to_string();
-                    state.edit_select_all = true;
+                    if state.active_edit == Some(EditTarget::MaxGopHops) {
+                        // Second click on the focused box: drop the selection, keep the caret.
+                        state.edit_caret_to_end();
+                    } else {
+                        commit_active_edit(state);
+                        state.active_edit = Some(EditTarget::MaxGopHops);
+                        state.edit_buffer = state.settings.max_gop_hops.to_string();
+                        state.edit_select_all_text();
+                    }
                     let _ = InvalidateRect(hwnd, None, false);
                     return;
                 } else if y >= btn_gop_y && y <= btn_gop_y + btn_sz {
@@ -3332,7 +3882,7 @@ unsafe fn handle_content_click(hwnd: HWND, state: &mut AppState, x: i32, y: i32)
                         state.settings.max_gop_hops = state.settings.max_gop_hops.saturating_sub(1);
                         if state.active_edit == Some(EditTarget::MaxGopHops) {
                             state.edit_buffer = state.settings.max_gop_hops.to_string();
-                            state.edit_select_all = false;
+                            state.edit_caret_to_end();
                         }
                         let _ = state.settings.save();
                         let _ = InvalidateRect(hwnd, None, false);
@@ -3342,7 +3892,7 @@ unsafe fn handle_content_click(hwnd: HWND, state: &mut AppState, x: i32, y: i32)
                         state.settings.max_gop_hops = (state.settings.max_gop_hops + 1).min(20);
                         if state.active_edit == Some(EditTarget::MaxGopHops) {
                             state.edit_buffer = state.settings.max_gop_hops.to_string();
-                            state.edit_select_all = false;
+                            state.edit_caret_to_end();
                         }
                         let _ = state.settings.save();
                         let _ = InvalidateRect(hwnd, None, false);
@@ -3357,10 +3907,15 @@ unsafe fn handle_content_click(hwnd: HWND, state: &mut AppState, x: i32, y: i32)
             let btn_consec_y = box_consec_y + (box_h - btn_sz) / 2;
             if is_custom {
                 if y >= box_consec_y && y <= box_consec_y + box_h && x >= box_x && x <= box_x + box_w {
-                    commit_active_edit(state);
-                    state.active_edit = Some(EditTarget::ConsecutiveLimit);
-                    state.edit_buffer = state.settings.consecutive_unacceptable_limit.to_string();
-                    state.edit_select_all = true;
+                    if state.active_edit == Some(EditTarget::ConsecutiveLimit) {
+                        // Second click on the focused box: drop the selection, keep the caret.
+                        state.edit_caret_to_end();
+                    } else {
+                        commit_active_edit(state);
+                        state.active_edit = Some(EditTarget::ConsecutiveLimit);
+                        state.edit_buffer = state.settings.consecutive_unacceptable_limit.to_string();
+                        state.edit_select_all_text();
+                    }
                     let _ = InvalidateRect(hwnd, None, false);
                     return;
                 } else if y >= btn_consec_y && y <= btn_consec_y + btn_sz {
@@ -3369,7 +3924,7 @@ unsafe fn handle_content_click(hwnd: HWND, state: &mut AppState, x: i32, y: i32)
                         state.settings.consecutive_unacceptable_limit = state.settings.consecutive_unacceptable_limit.saturating_sub(1).max(1);
                         if state.active_edit == Some(EditTarget::ConsecutiveLimit) {
                             state.edit_buffer = state.settings.consecutive_unacceptable_limit.to_string();
-                            state.edit_select_all = false;
+                            state.edit_caret_to_end();
                         }
                         let _ = state.settings.save();
                         let _ = InvalidateRect(hwnd, None, false);
@@ -3379,7 +3934,7 @@ unsafe fn handle_content_click(hwnd: HWND, state: &mut AppState, x: i32, y: i32)
                         state.settings.consecutive_unacceptable_limit = (state.settings.consecutive_unacceptable_limit + 1).min(20);
                         if state.active_edit == Some(EditTarget::ConsecutiveLimit) {
                             state.edit_buffer = state.settings.consecutive_unacceptable_limit.to_string();
-                            state.edit_select_all = false;
+                            state.edit_caret_to_end();
                         }
                         let _ = state.settings.save();
                         let _ = InvalidateRect(hwnd, None, false);
@@ -3394,10 +3949,15 @@ unsafe fn handle_content_click(hwnd: HWND, state: &mut AppState, x: i32, y: i32)
             let btn_timeout_y = box_timeout_y + (box_h - btn_sz) / 2;
             if is_custom {
                 if y >= box_timeout_y && y <= box_timeout_y + box_h && x >= box_x && x <= box_x + box_w {
-                    commit_active_edit(state);
-                    state.active_edit = Some(EditTarget::WatchdogTimeoutSec);
-                    state.edit_buffer = state.settings.watchdog_timeout_sec.to_string();
-                    state.edit_select_all = true;
+                    if state.active_edit == Some(EditTarget::WatchdogTimeoutSec) {
+                        // Second click on the focused box: drop the selection, keep the caret.
+                        state.edit_caret_to_end();
+                    } else {
+                        commit_active_edit(state);
+                        state.active_edit = Some(EditTarget::WatchdogTimeoutSec);
+                        state.edit_buffer = state.settings.watchdog_timeout_sec.to_string();
+                        state.edit_select_all_text();
+                    }
                     let _ = InvalidateRect(hwnd, None, false);
                     return;
                 } else if y >= btn_timeout_y && y <= btn_timeout_y + btn_sz {
@@ -3406,7 +3966,7 @@ unsafe fn handle_content_click(hwnd: HWND, state: &mut AppState, x: i32, y: i32)
                         state.settings.watchdog_timeout_sec = state.settings.watchdog_timeout_sec.saturating_sub(1).max(3);
                         if state.active_edit == Some(EditTarget::WatchdogTimeoutSec) {
                             state.edit_buffer = state.settings.watchdog_timeout_sec.to_string();
-                            state.edit_select_all = false;
+                            state.edit_caret_to_end();
                         }
                         let _ = state.settings.save();
                         let _ = InvalidateRect(hwnd, None, false);
@@ -3416,7 +3976,7 @@ unsafe fn handle_content_click(hwnd: HWND, state: &mut AppState, x: i32, y: i32)
                         state.settings.watchdog_timeout_sec = (state.settings.watchdog_timeout_sec + 1).min(60);
                         if state.active_edit == Some(EditTarget::WatchdogTimeoutSec) {
                             state.edit_buffer = state.settings.watchdog_timeout_sec.to_string();
-                            state.edit_select_all = false;
+                            state.edit_caret_to_end();
                         }
                         let _ = state.settings.save();
                         let _ = InvalidateRect(hwnd, None, false);
@@ -3529,7 +4089,7 @@ unsafe fn handle_content_click(hwnd: HWND, state: &mut AppState, x: i32, y: i32)
                         state.active_edit = Some(EditTarget::CustomTextExtensions);
                         state.edit_buffer = state.settings.custom_text_extensions.clone();
                     }
-                    state.edit_select_all = false;
+                    state.edit_caret_to_end();
                     let _ = InvalidateRect(hwnd, None, false);
                     return;
                 } else if x >= btn_x && x <= btn_x + btn_w {
@@ -3559,6 +4119,7 @@ unsafe fn handle_content_click(hwnd: HWND, state: &mut AppState, x: i32, y: i32)
             // Button 1: Clear cache
             if x >= btn1_x && x <= btn1_x + btn_w && y >= btn_y && y <= btn_y + btn_h {
                 state.trigger_button_anim(hwnd, 300, false);
+                state.prewarm_shown = false;
                 let (count, bytes) = clear_thumbnail_cache();
                 state.cache_status_kind = CacheStatusKind::Cleared(count, bytes);
                 state.cache_status_msg = state.get_cache_status_display();
@@ -3571,10 +4132,27 @@ unsafe fn handle_content_click(hwnd: HWND, state: &mut AppState, x: i32, y: i32)
             let btn2_x = btn1_x + btn_w + btn_gap;
             if x >= btn2_x && x <= btn2_x + btn_w && y >= btn_y && y <= btn_y + btn_h {
                 state.trigger_button_anim(hwnd, 301, false);
-                notify_shell_associations_changed();
-                state.cache_status_kind = CacheStatusKind::PreFill;
-                state.cache_status_msg = state.get_cache_status_display();
+                if state.prewarm.is_active() {
+                    state.prewarm.cancel.store(true, std::sync::atomic::Ordering::Release);
+                } else if let Some(folder) = pick_folder(hwnd) {
+                    start_prewarm(state, folder);
+                }
                 let _ = InvalidateRect(hwnd, None, false);
+                return;
+            }
+
+            // Thumbnail size used for pre-generation (cycles 96 / 256 / 768).
+            let (size_x, size_y, size_w, size_h) = prewarm_size_button_geom(state, content_x, content_w, card1_y);
+            if x >= size_x && x <= size_x + size_w && y >= size_y && y <= size_y + size_h {
+                if !state.prewarm.is_active() {
+                    state.trigger_button_anim(hwnd, 303, false);
+                    state.prewarm_size = match state.prewarm_size {
+                        96 => 256,
+                        256 => 768,
+                        _ => 96,
+                    };
+                    let _ = InvalidateRect(hwnd, None, false);
+                }
                 return;
             }
 
@@ -3660,8 +4238,27 @@ unsafe fn handle_content_click(hwnd: HWND, state: &mut AppState, x: i32, y: i32)
             let sw_y = card2_y + scale_px(8, state.dpi);
             let sw_h = scale_px(24, state.dpi);
 
+            // Lock button left of the toggle: keep logging on instead of auto-off after 10 min.
+            let (lock_x, lock_w) = monitor_lock_button_geom(state, sw_x);
+            if state.settings.monitor_enabled && x >= lock_x && x <= lock_x + lock_w && y >= sw_y && y <= sw_y + sw_h {
+                state.trigger_button_anim(hwnd, 97, false);
+                state.settings.monitor_locked = !state.settings.monitor_locked;
+                if !state.settings.monitor_locked {
+                    // Unlocking starts a fresh 10-minute window.
+                    state.settings.monitor_enabled_at = unix_now().min(u32::MAX as u64) as u32;
+                }
+                let _ = state.settings.save();
+                state.monitor_left_min = None;
+                let _ = InvalidateRect(hwnd, None, false);
+                return;
+            }
+
             if x >= sw_x && x <= sw_x + sw_card_w && y >= sw_y && y <= sw_y + sw_h {
                 state.settings.monitor_enabled = !state.settings.monitor_enabled;
+                state.settings.monitor_locked = false;
+                if state.settings.monitor_enabled {
+                    state.settings.monitor_enabled_at = unix_now().min(u32::MAX as u64) as u32;
+                }
                 let is_expanding = state.settings.monitor_enabled;
                 state.monitor_anim_start = Some((std::time::Instant::now(), is_expanding));
                 let _ = SetTimer(hwnd, 1, 16, None);
@@ -3690,10 +4287,18 @@ unsafe fn handle_content_click(hwnd: HWND, state: &mut AppState, x: i32, y: i32)
             let dd_gap = scale_px(6, state.dpi);
             let status_dd_w = scale_px(98, state.dpi);
             let pipe_dd_w = scale_px(104, state.dpi);
-            let status_dd_x = clr_x - scale_px(10, state.dpi) - status_dd_w;
+            let exp_w = scale_px(85, state.dpi);
+            let exp_x = clr_x - scale_px(6, state.dpi) - exp_w;
+            let status_dd_x = exp_x - scale_px(17, state.dpi) - status_dd_w;
             let pipe_dd_x = status_dd_x - dd_gap - pipe_dd_w;
 
             if state.settings.monitor_enabled && state.monitor_expand_anim > 0.8 {
+                if x >= exp_x && x <= exp_x + exp_w && y >= metrics_y && y <= metrics_y + clr_h {
+                    state.trigger_button_anim(hwnd, 306, false);
+                    export_activity_log(hwnd, state);
+                    let _ = InvalidateRect(hwnd, None, false);
+                    return;
+                }
                 if x >= clr_x && x <= clr_x + clr_w && y >= metrics_y && y <= metrics_y + clr_h {
                     state.trigger_button_anim(hwnd, 304, false);
                     cbx_core::monitor::clear_all_history();
@@ -3795,7 +4400,19 @@ unsafe fn handle_content_click(hwnd: HWND, state: &mut AppState, x: i32, y: i32)
                 }
             }
         }
-        ManagerTab::About => {}
+        ManagerTab::About => {
+            let card1_y = scale_px(75, state.dpi) + offset_banner;
+            let upd_y = card1_y + state.about_card1_h.get() + scale_px(14, state.dpi);
+            for b in about_update_buttons(state, content_x, content_w, upd_y) {
+                if b.disabled || x < b.x || x > b.x + b.w || y < b.y || y > b.y + b.h {
+                    continue;
+                }
+                state.trigger_button_anim(hwnd, b.id, false);
+                handle_update_button(hwnd, state, b.id);
+                let _ = InvalidateRect(hwnd, None, false);
+                return;
+            }
+        }
     }
 }
 
@@ -4039,6 +4656,10 @@ unsafe fn handle_drop_files(hwnd: HWND, hdrop: HDROP) {
         if path.is_file() {
             inspect_file_live(state, &path);
             state.active_tab = ManagerTab::Advanced;
+            let _ = InvalidateRect(hwnd, None, false);
+        } else if path.is_dir() {
+            state.active_tab = ManagerTab::Advanced;
+            start_prewarm(state, path);
             let _ = InvalidateRect(hwnd, None, false);
         }
     }
@@ -4352,6 +4973,47 @@ fn inspect_file_live(state: &mut AppState, path: &Path) {
 // Fluent UI Renderer
 // -----------------------------------------------------------------------------
 
+/// One horizontal or vertical running-sum box blur pass over 4-channel pixels (edges clamped).
+fn box_blur_1d(src: &[[u32; 4]], dst: &mut [[u32; 4]], w: usize, h: usize, r: usize, horizontal: bool) {
+    let (outer, inner) = if horizontal { (h, w) } else { (w, h) };
+    let idx = |o: usize, i: usize| if horizontal { o * w + i } else { i * w + o };
+    let win = (2 * r + 1) as u32;
+    for o in 0..outer {
+        let mut sum = [0u32; 4];
+        for k in 0..=(2 * r) {
+            let i = k.saturating_sub(r).min(inner - 1);
+            let p = src[idx(o, i)];
+            for c in 0..4 {
+                sum[c] += p[c];
+            }
+        }
+        for i in 0..inner {
+            let mut out = [0u32; 4];
+            for c in 0..4 {
+                out[c] = sum[c] / win;
+            }
+            dst[idx(o, i)] = out;
+            let add = src[idx(o, (i + r + 1).min(inner - 1))];
+            let sub = src[idx(o, i.saturating_sub(r))];
+            for c in 0..4 {
+                sum[c] = sum[c] + add[c] - sub[c];
+            }
+        }
+    }
+}
+
+/// Anti-aliased coverage (0..1) of a pixel centre inside a rounded rectangle.
+fn round_rect_coverage(fx: f32, fy: f32, x0: f32, y0: f32, x1: f32, y1: f32, r: f32) -> f32 {
+    let cx = fx.clamp(x0 + r, x1 - r);
+    let cy = fy.clamp(y0 + r, y1 - r);
+    let d = ((fx - cx).powi(2) + (fy - cy).powi(2)).sqrt() - r;
+    let inside_box = fx >= x0 && fx <= x1 && fy >= y0 && fy <= y1;
+    if !inside_box {
+        return 0.0;
+    }
+    (0.5 - d).clamp(0.0, 1.0)
+}
+
 struct DibSurface {
     bits: *mut u32,
     w: i32,
@@ -4450,19 +5112,45 @@ impl DibSurface {
         }
     }
 
-    unsafe fn stamp_opaque_nonzero_rect(&self, x0: i32, y0: i32, x1: i32, y1: i32) {
+    /// In-app acrylic: blurs the premultiplied pixels inside a rounded rectangle (three box-blur
+    /// passes ≈ Gaussian), blending at the anti-aliased edge so corners stay round.
+    unsafe fn blur_round_rect(&self, x0: i32, y0: i32, x1: i32, y1: i32, radius: i32, blur: i32) {
         let sx0 = x0.max(0);
         let sy0 = y0.max(0);
         let sx1 = x1.min(self.w);
         let sy1 = y1.min(self.h);
+        let (w, h) = (sx1 - sx0, sy1 - sy0);
+        if w <= 2 || h <= 2 || blur <= 0 {
+            return;
+        }
+        let (wu, hu) = (w as usize, h as usize);
+        let mut buf: Vec<[u32; 4]> = Vec::with_capacity(wu * hu);
         for py in sy0..sy1 {
-            let row_off = (py as usize) * (self.w as usize);
+            let row = (py as usize) * (self.w as usize);
             for px in sx0..sx1 {
-                let ptr = self.bits.add(row_off + (px as usize));
-                let val = *ptr;
-                if (val & 0x00FF_FFFF) != 0 {
-                    *ptr = val | 0xFF00_0000;
+                let v = *self.bits.add(row + px as usize);
+                buf.push([v & 0xFF, (v >> 8) & 0xFF, (v >> 16) & 0xFF, v >> 24]);
+            }
+        }
+        let r = (blur / 3).max(1) as usize;
+        let mut tmp = buf.clone();
+        for _ in 0..3 {
+            box_blur_1d(&buf, &mut tmp, wu, hu, r, true);
+            box_blur_1d(&tmp, &mut buf, wu, hu, r, false);
+        }
+        let rad = (radius as f32).min(w.min(h) as f32 * 0.5);
+        for py in sy0..sy1 {
+            let row = (py as usize) * (self.w as usize);
+            for px in sx0..sx1 {
+                let c = round_rect_coverage(px as f32 + 0.5, py as f32 + 0.5, x0 as f32, y0 as f32, x1 as f32, y1 as f32, rad);
+                if c <= 0.0 {
+                    continue;
                 }
+                let b = buf[((py - sy0) as usize) * wu + (px - sx0) as usize];
+                let ptr = self.bits.add(row + px as usize);
+                let o = *ptr;
+                let mix = |ov: u32, nv: u32| -> u32 { ((ov as f32) * (1.0 - c) + (nv as f32) * c).round().clamp(0.0, 255.0) as u32 };
+                *ptr = mix(o & 0xFF, b[0]) | (mix((o >> 8) & 0xFF, b[1]) << 8) | (mix((o >> 16) & 0xFF, b[2]) << 16) | (mix(o >> 24, b[3]) << 24);
             }
         }
     }
@@ -4575,6 +5263,26 @@ impl DibSurface {
         }
     }
 
+    /// Makes the plain page background of the content panel (pixels exactly equal to the opaque
+    /// `bg_bgr`) translucent, so the Mica backdrop glows through it more darkly than through the
+    /// rail; cards, text and controls stay opaque. Call after `stamp_content_panel_alpha`.
+    unsafe fn tint_content_background(&self, sidebar_w: i32, bg_bgr: u32, alpha: u32) {
+        let (r, g, b) = (bg_bgr & 0xFF, (bg_bgr >> 8) & 0xFF, (bg_bgr >> 16) & 0xFF);
+        let opaque = 0xFF00_0000 | (r << 16) | (g << 8) | b;
+        let a = alpha.min(255);
+        let pm = |c: u32| (c * a + 127) / 255;
+        let translucent = (a << 24) | (pm(r) << 16) | (pm(g) << 8) | pm(b);
+        for py in 0..self.h {
+            let row_off = (py as usize) * (self.w as usize);
+            for px in sidebar_w.max(0)..self.w {
+                let ptr = self.bits.add(row_off + (px as usize));
+                if *ptr == opaque {
+                    *ptr = translucent;
+                }
+            }
+        }
+    }
+
     unsafe fn stamp_content_panel_alpha(&self, sidebar_w: i32, radius: i32) {
         let sx0 = sidebar_w.max(0);
         let r_inner = (radius as f32 - 1.5).max(0.0);
@@ -4626,22 +5334,358 @@ unsafe fn draw_composited_text(
     let _ = DrawTextW(hdc, &mut wide, &mut rc, flags);
 }
 
+/// Current width (physical px) of the navigation rail, following the collapse animation.
+fn sidebar_width(state: &AppState) -> i32 {
+    let full = scale_px(SIDEBAR_BASE_WIDTH, state.dpi) as f32;
+    let narrow = scale_px(SIDEBAR_COLLAPSED_WIDTH, state.dpi) as f32;
+    (full + (narrow - full) * state.sidebar_anim.clamp(0.0, 1.0)).round() as i32
+}
+
+/// Language button geometry in the rail: (x, width, flyout width). When the rail is collapsed the
+/// button shrinks to an icon-sized square and its flyout keeps a readable width.
+fn lang_button_geom(state: &AppState, sidebar_w: i32) -> (i32, i32, i32) {
+    let x = scale_px(10, state.dpi);
+    let w = (sidebar_w - x * 2).max(scale_px(RAIL_ICON_COL_W, state.dpi));
+    (x, w, w.max(scale_px(160, state.dpi)))
+}
+
+/// Right edge of the area the language button and its flyout can cover (for partial repaints).
+fn lang_invalidate_right(state: &AppState) -> i32 {
+    let sidebar_w = sidebar_width(state);
+    let (x, _, menu_w) = lang_button_geom(state, sidebar_w);
+    sidebar_w.max(x + menu_w + 1)
+}
+
+/// Rail toggle button rectangle (UI coordinates).
+fn hamburger_rect(state: &AppState) -> RECT {
+    let x = scale_px(10, state.dpi);
+    let y = scale_px(HAMBURGER_Y, state.dpi);
+    RECT {
+        left: x,
+        top: y,
+        right: x + scale_px(HAMBURGER_W, state.dpi),
+        bottom: y + scale_px(HAMBURGER_H, state.dpi),
+    }
+}
+
+/// Sidebar status text without any version prefix. Older locale files (e.g. a `locales` folder
+/// left next to an installed exe) hard-coded "2.0.0 • …"; the version now comes from
+/// `APP_VERSION`, so a leading "X.Y.Z • " is dropped instead of being shown twice.
+fn status_label(key: &str) -> String {
+    let text = i18n::t(key);
+    let t = text.trim_start();
+    if let Some((head, rest)) = t.split_once('•') {
+        let head = head.trim();
+        if !head.is_empty() && head.chars().all(|c| c.is_ascii_digit() || c == '.') {
+            return rest.trim_start().to_string();
+        }
+    }
+    text.to_string()
+}
+
+/// Duration of the selected-indicator squash when a flyout item is pressed (seconds).
+const FLYOUT_PRESS_SECS: f32 = 0.12;
+
+/// Win11 ComboBox-style flyout geometry. The list keeps its full content; it opens so that the
+/// selected row lies on top of the trigger button and grows up and down from there, and is only
+/// shifted (never shortened) when the window is too small to centre it.
+#[derive(Clone, Copy)]
+struct FlyoutGeom {
+    x: i32,
+    w: i32,
+    top: i32,
+    full_h: i32,
+    item_h: i32,
+    padding: i32,
+    count: usize,
+    sel: usize,
+}
+
+impl FlyoutGeom {
+    #[allow(clippy::too_many_arguments)]
+    fn new(x: i32, w: i32, btn_y: i32, btn_h: i32, count: usize, sel: usize, item_h: i32, padding: i32, bound_top: i32, bound_bottom: i32) -> Self {
+        let sel = sel.min(count.saturating_sub(1));
+        let full_h = count as i32 * item_h + padding * 2;
+        let mut top = btn_y + btn_h / 2 - padding - sel as i32 * item_h - item_h / 2;
+        top = top.min(bound_bottom - full_h);
+        top = top.max(bound_top);
+        FlyoutGeom { x, w, top, full_h, item_h, padding, count, sel }
+    }
+
+    fn item_top(&self, i: usize) -> i32 {
+        self.top + self.padding + i as i32 * self.item_h
+    }
+
+    fn contains(&self, x: i32, y: i32) -> bool {
+        x >= self.x && x < self.x + self.w && y >= self.top && y < self.top + self.full_h
+    }
+
+    fn item_at(&self, x: i32, y: i32) -> Option<usize> {
+        if !self.contains(x, y) {
+            return None;
+        }
+        let rel = y - self.top - self.padding;
+        if rel < 0 {
+            return None;
+        }
+        let idx = (rel / self.item_h) as usize;
+        (idx < self.count).then_some(idx)
+    }
+
+    /// Visible vertical span while opening: from the selected row out to the full list.
+    fn visible(&self, anim: f32) -> (i32, i32) {
+        let t = anim.clamp(0.0, 1.0);
+        let s0 = self.item_top(self.sel) - self.padding;
+        let s1 = self.item_top(self.sel) + self.item_h + self.padding;
+        let lerp = |a: i32, b: i32| a + ((b - a) as f32 * t).round() as i32;
+        (lerp(s0, self.top), lerp(s1, self.top + self.full_h))
+    }
+}
+
+/// Flyout of the language button at the bottom of the rail.
+fn lang_flyout_geom(state: &AppState, win_h: i32) -> FlyoutGeom {
+    let sidebar_w = sidebar_width(state);
+    let (lang_x, _, menu_w) = lang_button_geom(state, sidebar_w);
+    let lang_y = win_h - scale_px(50, state.dpi);
+    let sel = AVAILABLE_LOCALES.iter().position(|l| l.lang == current_lang()).unwrap_or(0);
+    FlyoutGeom::new(
+        lang_x,
+        menu_w,
+        lang_y,
+        scale_px(LANG_BTN_H, state.dpi),
+        AVAILABLE_LOCALES.len(),
+        sel,
+        scale_px(36, state.dpi),
+        scale_px(4, state.dpi),
+        scale_px(8, state.dpi),
+        win_h - scale_px(8, state.dpi),
+    )
+}
+
+fn monitor_pipeline_options() -> [(&'static str, MonitorPipelineFilter); 5] {
+    [
+        (tr("全部管道", "All Pipelines"), MonitorPipelineFilter::All),
+        (tr("檔案直讀", "Direct File"), MonitorPipelineFilter::DirectFile),
+        (tr("IPC 命中", "IPC Hit"), MonitorPipelineFilter::IpcHit),
+        (tr("搜尋命中", "Search Hit"), MonitorPipelineFilter::SearchHit),
+        (tr("串流 RPC", "Stream RPC"), MonitorPipelineFilter::StreamRpc),
+    ]
+}
+
+fn monitor_status_options() -> [(&'static str, MonitorFilter); 4] {
+    [
+        (tr("全部狀態", "All Status"), MonitorFilter::All),
+        (tr("正常", "OK"), MonitorFilter::Success),
+        (tr("耗時", "Slow"), MonitorFilter::Slow),
+        (tr("中斷/跳過", "Errors"), MonitorFilter::InterruptedOrSkipped),
+    ]
+}
+
+/// Flyout of an open monitor filter button (0 = pipeline, 1 = status).
+fn monitor_flyout_geom(state: &AppState, win_h: i32) -> Option<FlyoutGeom> {
+    let kind = state.open_monitor_dropdown?;
+    let (pipe_x, status_x, btn_y, btn_h) = state.monitor_dropdown_anchor.get();
+    if btn_h <= 0 {
+        return None;
+    }
+    let (x, w, count, sel) = if kind == 0 {
+        let sel = monitor_pipeline_options().iter().position(|(_, v)| *v == state.monitor_pipeline_filter).unwrap_or(0);
+        (pipe_x, scale_px(114, state.dpi), 5, sel)
+    } else {
+        let sel = monitor_status_options().iter().position(|(_, v)| *v == state.monitor_filter).unwrap_or(0);
+        (status_x, scale_px(108, state.dpi), 4, sel)
+    };
+    Some(FlyoutGeom::new(
+        x,
+        w,
+        btn_y,
+        btn_h,
+        count,
+        sel,
+        scale_px(28, state.dpi),
+        scale_px(4, state.dpi),
+        scale_px(8, state.dpi),
+        win_h - scale_px(8, state.dpi),
+    ))
+}
+
+/// Applies a language chosen from the flyout.
+unsafe fn apply_language_choice(hwnd: HWND, state: &mut AppState, idx: usize) {
+    if let Some(loc) = AVAILABLE_LOCALES.get(idx) {
+        set_current_lang(loc.lang);
+        loc.lang.save();
+        let title_w = to_wide(window_title());
+        let _ = SetWindowTextW(hwnd, PCWSTR(title_w.as_ptr()));
+        state.cache_status_msg = state.get_cache_status_display();
+        state.test_metrics_str = state.get_test_metrics_display();
+    }
+}
+
+/// Applies a monitor filter chosen from the flyout.
+fn apply_monitor_filter_choice(state: &mut AppState, kind: u8, idx: usize) {
+    if kind == 0 {
+        if let Some((_, v)) = monitor_pipeline_options().get(idx) {
+            state.monitor_pipeline_filter = *v;
+        }
+    } else if let Some((_, v)) = monitor_status_options().get(idx) {
+        state.monitor_filter = *v;
+    }
+    state.monitor_scroll = 0;
+}
+
+/// Draws an acrylic flyout list: the content beneath is blurred inside the rounded frame, tinted
+/// with a translucent card colour (over the rail the window backdrop keeps showing through), and
+/// rows show hover / pressed / selected states. Selection itself happens on mouse release.
+#[allow(clippy::too_many_arguments)]
+unsafe fn draw_acrylic_flyout(
+    hdc: HDC,
+    dib: &DibSurface,
+    htheme: HTHEME,
+    state: &AppState,
+    g: &FlyoutGeom,
+    labels: &[&str],
+    hover: Option<usize>,
+    pressed: Option<usize>,
+    anim: f32,
+    font: HFONT,
+) {
+    let th = theme();
+    let (vt, vb) = g.visible(anim);
+    if vb <= vt {
+        return;
+    }
+    let radius = scale_px(8, state.dpi);
+    dib.blur_round_rect(g.x, vt, g.x + g.w, vb, radius, scale_px(12, state.dpi));
+    let (tint, tint_a) = if th.dark { (0x002C2C2C, 0xD8) } else { (0x00F9F9F9, 0xD8) };
+    dib.fill_rounded_translucent(g.x, vt, g.w, vb - vt, radius, tint, tint_a, th.btn_border, 0xFF);
+
+    let rgn = CreateRectRgn(g.x, vt, g.x + g.w, vb);
+    let _ = SelectClipRgn(hdc, rgn);
+    let old_f = SelectObject(hdc, font);
+    let overlay = if th.dark { 0x00FFFFFF } else { 0x00000000 };
+    let item_r = scale_px(4, state.dpi);
+    for (i, label) in labels.iter().enumerate().take(g.count) {
+        let ix = g.x + g.padding;
+        let iw = g.w - g.padding * 2;
+        let iy = g.item_top(i);
+        let (ry0, ry1) = (iy.max(vt + 1), (iy + g.item_h).min(vb - 1));
+        if ry1 <= ry0 {
+            continue;
+        }
+        let is_sel = i == g.sel;
+        let is_pressed = pressed == Some(i);
+        let is_hover = hover == Some(i);
+        let row_a: u8 = if is_pressed {
+            if th.dark { 9 } else { 6 }
+        } else if is_hover || is_sel {
+            if th.dark { 16 } else { 11 }
+        } else {
+            0
+        };
+        if row_a > 0 {
+            dib.fill_rounded_translucent(ix, ry0, iw, ry1 - ry0, item_r, overlay, row_a, overlay, 0);
+        }
+        if is_sel {
+            // Accent indicator; squashes briefly while the selected row itself is pressed.
+            let mut ind_h = scale_px(16, state.dpi) as f32;
+            if is_pressed {
+                if let Some(t0) = state.flyout_press_start {
+                    let p = (t0.elapsed().as_secs_f32() / FLYOUT_PRESS_SECS).clamp(0.0, 1.0);
+                    ind_h *= 1.0 - 0.4 * (1.0 - (1.0 - p).powi(3));
+                }
+            }
+            let ind_h = ind_h.round() as i32;
+            let ind_w = scale_px(3, state.dpi);
+            let ind_y = (iy + (g.item_h - ind_h) / 2).max(ry0);
+            let ind_b = (iy + (g.item_h + ind_h) / 2).min(ry1);
+            if ind_b > ind_y {
+                let acc = accent_base_bgr();
+                dib.fill_rounded_translucent(ix + scale_px(2, state.dpi), ind_y, ind_w, ind_b - ind_y, ind_w, acc, 255, acc, 0);
+            }
+        }
+        let text_col = if is_pressed { th.text_secondary } else if is_sel { th.text_bright } else { th.text_primary };
+        draw_composited_text(
+            hdc,
+            htheme,
+            label,
+            RECT { left: ix + scale_px(14, state.dpi), top: iy, right: ix + iw - scale_px(6, state.dpi), bottom: iy + g.item_h },
+            text_col,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
+        );
+    }
+    SelectObject(hdc, old_f);
+    let _ = SelectClipRgn(hdc, None);
+    let _ = DeleteObject(rgn);
+}
+
+/// Window title, also painted in the custom title bar.
+fn window_title() -> &'static str {
+    tr("CBX Shell 控制中心", "CBX Shell Control Center")
+}
+
+/// Height (physical px) of the top resize band of the custom title bar.
+unsafe fn resize_frame_h(hwnd: HWND) -> i32 {
+    let dpi = GetDpiForWindow(hwnd).max(96);
+    GetSystemMetricsForDpi(SM_CYSIZEFRAME, dpi) + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi)
+}
+
+/// Height (physical px) of the custom title bar strip, matching the system caption so DWM's
+/// caption buttons fit exactly. The UI below keeps its own coordinates: y = 0 is the first row
+/// under this strip (see `logical_client_rect` and the mouse handlers in `wnd_proc`).
+unsafe fn titlebar_h(hwnd: HWND) -> i32 {
+    let dpi = GetDpiForWindow(hwnd).max(96);
+    let system = GetSystemMetricsForDpi(SM_CYCAPTION, dpi) + resize_frame_h(hwnd);
+    system.max(scale_px(TITLEBAR_BASE_H, dpi))
+}
+
+/// Client rectangle of the UI area below the custom title bar, in UI coordinates.
+unsafe fn logical_client_rect(hwnd: HWND, rect: &mut RECT) -> windows::core::Result<()> {
+    windows::Win32::UI::WindowsAndMessaging::GetClientRect(hwnd, rect)?;
+    rect.bottom = (rect.bottom - titlebar_h(hwnd)).max(rect.top + 1);
+    Ok(())
+}
+
+/// Draws the window title, vertically centred in the custom title bar strip (between the window
+/// edge and the top of the content panel), independent of the rail's width.
+unsafe fn draw_window_title(hdc: HDC, htheme: HTHEME, state: &AppState, cap: i32) {
+    let old = SelectObject(hdc, state.font_title);
+    let x = scale_px(20, state.dpi);
+    draw_composited_text(
+        hdc,
+        htheme,
+        window_title(),
+        RECT {
+            left: x,
+            top: 0,
+            right: x + scale_px(600, state.dpi),
+            bottom: cap,
+        },
+        theme().text_primary,
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+    );
+    SelectObject(hdc, old);
+}
+
 unsafe fn render_fluent_ui(hwnd: HWND, hdc: HDC, paint_rect: &RECT) {
     let Some(mut state_guard) = state_lock() else { return };
     let state: &mut AppState = &mut state_guard;
     let mut rect = RECT::default();
-    let _ = GetClientRect(hwnd, &mut rect);
+    let _ = logical_client_rect(hwnd, &mut rect);
     let w = (rect.right - rect.left).max(1);
     let h = (rect.bottom - rect.top).max(1);
 
-    let sidebar_w = scale_px(SIDEBAR_BASE_WIDTH, state.dpi);
+    let sidebar_w = sidebar_width(state);
     let sidebar_only = paint_rect.right > 0
         && paint_rect.right <= sidebar_w
         && state.expanded_monitor_item.is_none()
         && state.open_monitor_dropdown.is_none();
 
+    let mut layout_content_h = None;
     if !sidebar_only {
+        state.edit_clear_rect.set(None);
+        state.edit_boxes.borrow_mut().clear();
         let total_content_h = calculate_content_height(state);
+        layout_content_h = Some(total_content_h);
         state.max_scroll_y = (total_content_h - h).max(0);
         if state.scroll_y > state.max_scroll_y {
             state.scroll_y = state.max_scroll_y;
@@ -4704,29 +5748,26 @@ unsafe fn render_fluent_ui(hwnd: HWND, hdc: HDC, paint_rect: &RECT) {
     // 2. Render the translucent navigation rail (frosted Acrylic backdrop shows through)
     let htheme = OpenThemeData(hwnd, w!("Window"));
     render_sidebar(mem_dc, &dib, htheme, state, sidebar_w, h);
-    if !htheme.is_invalid() {
-        let _ = CloseThemeData(htheme);
-    }
+    let cap = titlebar_h(hwnd);
 
     if state.is_lang_menu_open {
-        draw_language_flyout_menu(mem_dc, state, sidebar_w, h);
-        let lang_y = h - scale_px(50, state.dpi);
-        let lang_x = scale_px(16, state.dpi);
-        let lang_w = sidebar_w - scale_px(32, state.dpi);
-        let lang_h = scale_px(32, state.dpi);
-        let btn_bottom = lang_y + lang_h;
-        let item_h = scale_px(36, state.dpi);
-        let padding = scale_px(4, state.dpi);
-        let full_menu_h = (AVAILABLE_LOCALES.len() as i32 * item_h) + padding * 2;
-        let anim_val = if state.lang_menu_anim_start.is_some() { state.lang_menu_anim } else { 1.0 };
-        let current_h = lang_h + (((full_menu_h - lang_h) as f32) * anim_val) as i32;
-        let menu_top = btn_bottom - current_h;
-        dib.stamp_opaque_round_rect(lang_x, menu_top, lang_x + lang_w, btn_bottom, scale_px(8, state.dpi));
+        let g = lang_flyout_geom(state, h);
+        let labels: Vec<&str> = AVAILABLE_LOCALES.iter().map(|l| l.display_name).collect();
+        let anim = if state.lang_menu_anim_start.is_some() { state.lang_menu_anim } else { 1.0 };
+        draw_acrylic_flyout(mem_dc, &dib, htheme, state, &g, &labels, state.hover_lang_item, state.pressed_lang_item, anim, state.font_regular);
     }
 
     if !sidebar_only {
         if state.active_tab == ManagerTab::Advanced && state.open_monitor_dropdown.is_some() {
-            draw_monitor_dropdown_flyout(mem_dc, state);
+            if let Some(g) = monitor_flyout_geom(state, h) {
+                let labels: Vec<&str> = if state.open_monitor_dropdown == Some(0) {
+                    monitor_pipeline_options().iter().map(|(l, _)| *l).collect()
+                } else {
+                    monitor_status_options().iter().map(|(l, _)| *l).collect()
+                };
+                let anim = if state.monitor_dd_anim_start.is_some() { state.monitor_dd_anim } else { 1.0 };
+                draw_acrylic_flyout(mem_dc, &dib, htheme, state, &g, &labels, state.hover_monitor_dropdown_item, state.pressed_monitor_dd_item, anim, state.font_small);
+            }
         }
 
         if let Some(ref item) = state.expanded_monitor_item {
@@ -4739,6 +5780,9 @@ unsafe fn render_fluent_ui(hwnd: HWND, hdc: HDC, paint_rect: &RECT) {
             dib.stamp_opaque_round_rect(modal_x, modal_y, modal_x + modal_w, modal_y + modal_h, 8);
         } else {
             dib.stamp_content_panel_alpha(sidebar_w, content_radius);
+            if is_backdrop_active() {
+                dib.tint_content_background(sidebar_w, theme().win_bg, CONTENT_MICA_TINT_ALPHA);
+            }
         }
     }
 
@@ -4747,11 +5791,77 @@ unsafe fn render_fluent_ui(hwnd: HWND, hdc: HDC, paint_rect: &RECT) {
         dib.flatten_onto_opaque(theme().sidebar_bg);
     }
 
-    let _ = windows::Win32::Graphics::Gdi::BitBlt(hdc, 0, 0, target_w, h, mem_dc, 0, 0, windows::Win32::Graphics::Gdi::SRCCOPY);
+    let _ = windows::Win32::Graphics::Gdi::BitBlt(hdc, 0, cap, target_w, h, mem_dc, 0, 0, windows::Win32::Graphics::Gdi::SRCCOPY);
 
     SelectObject(mem_dc, old_bmp);
-    DeleteObject(mem_bmp);
+    let _ = DeleteObject(mem_bmp);
     let _ = DeleteDC(mem_dc);
+
+    // 3. Custom title bar strip: the same frosted backdrop shows through, DWM draws the caption
+    //    buttons on top, and we draw the window title.
+    render_title_bar(hdc, htheme, state, target_w, cap);
+
+    // Cards that size themselves to their content (e.g. the drag & drop result card) are only
+    // measured while painting; if that changed the page height, repaint once with the new
+    // scroll range.
+    if let Some(prev_h) = layout_content_h {
+        if calculate_content_height(state) != prev_h {
+            let _ = InvalidateRect(hwnd, None, false);
+        }
+    }
+    if !htheme.is_invalid() {
+        let _ = CloseThemeData(htheme);
+    }
+}
+
+unsafe fn render_title_bar(hdc: HDC, htheme: HTHEME, state: &AppState, w: i32, cap: i32) {
+    if cap <= 0 || w <= 0 {
+        return;
+    }
+    let strip_dc = CreateCompatibleDC(hdc);
+    let bmi = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: w,
+            biHeight: -cap, // top-down
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut bits_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+    let strip_bmp = match CreateDIBSection(strip_dc, &bmi, DIB_RGB_COLORS, &mut bits_ptr, None, 0) {
+        Ok(b) if !bits_ptr.is_null() => b,
+        _ => {
+            let _ = DeleteDC(strip_dc);
+            return;
+        }
+    };
+    let old_bmp = SelectObject(strip_dc, strip_bmp);
+    SetBkMode(strip_dc, TRANSPARENT);
+    std::ptr::write_bytes(bits_ptr as *mut u32, 0, (w as usize) * (cap as usize));
+    let strip = DibSurface {
+        bits: bits_ptr as *mut u32,
+        w,
+        h: cap,
+    };
+
+    draw_window_title(strip_dc, htheme, state, cap);
+    if state.expanded_monitor_item.is_some() {
+        // Same scrim as the modal dialog, so the title bar dims with the rest of the window.
+        let dark = theme().dark;
+        render_aa::draw_semi_transparent_rect(strip_dc, 0, 0, w, cap, 0x00000000, if dark { 0.65 } else { 0.35 });
+    }
+    if !is_backdrop_active() {
+        strip.flatten_onto_opaque(theme().sidebar_bg);
+    }
+
+    let _ = windows::Win32::Graphics::Gdi::BitBlt(hdc, 0, 0, w, cap, strip_dc, 0, 0, windows::Win32::Graphics::Gdi::SRCCOPY);
+    SelectObject(strip_dc, old_bmp);
+    let _ = DeleteObject(strip_bmp);
+    let _ = DeleteDC(strip_dc);
 }
 
 fn normalize_pipeline_display(p: &str) -> String {
@@ -5233,57 +6343,68 @@ unsafe fn render_sidebar(
 ) {
     SetBkMode(hdc, TRANSPARENT);
 
-    let icon_x = scale_px(20, state.dpi);
-    let icon_y = scale_px(20, state.dpi);
-
-    SelectObject(hdc, state.font_title);
-    draw_composited_text(
-        hdc,
-        htheme,
-        "CBX Shell",
-        RECT {
-            left: icon_x,
-            top: icon_y,
-            right: sidebar_w - scale_px(10, state.dpi),
-            bottom: icon_y + scale_px(26, state.dpi),
-        },
-        theme().text_primary,
-        DT_LEFT | DT_SINGLELINE | DT_NOPREFIX,
-    );
-
-    SelectObject(hdc, state.font_small);
     let th = theme();
+
+    // Rail toggle ("hamburger") button, Task Manager style: same translucent pill as nav items.
+    let hb = hamburger_rect(state);
+    let (mx, my) = state.mouse_pos;
+    let hb_hover = mx >= hb.left && mx < hb.right && my >= hb.top && my < hb.bottom;
+    let hb_a: u8 = if state.hamburger_pressed {
+        if th.dark { 10 } else { 7 }
+    } else if hb_hover {
+        if th.dark { 16 } else { 11 }
+    } else {
+        0
+    };
+    if hb_a > 0 {
+        let pill_bgr = if th.dark { 0x00FFFFFF } else { 0x00000000 };
+        dib.fill_rounded_translucent(hb.left, hb.top, hb.right - hb.left, hb.bottom - hb.top, scale_px(8, state.dpi), pill_bgr, hb_a, pill_bgr, 0);
+    }
+    SelectObject(hdc, state.font_chevron);
+    let hb_text = if state.hamburger_pressed {
+        if th.dark { 0x00A6A6A6 } else { 0x00666666 }
+    } else if th.dark {
+        0x00FFFFFF
+    } else {
+        0x001A1A1A
+    };
+    draw_composited_text(hdc, htheme, "\u{E700}", hb, hb_text, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+
+    // Version / engine status, to the right of the toggle; fades out as the rail collapses.
+    SelectObject(hdc, state.font_small);
     let (status_text, status_color) = if let Some(ref snap) = state.monitor_snapshot {
         if snap.active_tasks > 0 {
             let sec = snap.current_elapsed_ms / 1000;
             if sec >= 5 {
-                (format!("{} ({}s)", i18n::t("sidebar.status_processing_warn"), sec), th.status_warn)
+                (format!("{} • {} ({}s)", APP_VERSION, status_label("sidebar.status_processing_warn"), sec), th.status_warn)
             } else {
-                (format!("{} ({})", i18n::t("sidebar.status_processing"), snap.active_tasks), accent_light_bgr())
+                (format!("{} • {} ({})", APP_VERSION, status_label("sidebar.status_processing"), snap.active_tasks), accent_light_bgr())
             }
         } else {
-            (i18n::t("sidebar.status_ready"), th.status_ok)
+            (format!("{} • {}", APP_VERSION, status_label("sidebar.status_ready")), th.status_ok)
         }
     } else {
-        (i18n::t("sidebar.status_ready"), th.status_ok)
+        (format!("{} • {}", APP_VERSION, status_label("sidebar.status_ready")), th.status_ok)
     };
-    draw_composited_text(
-        hdc,
-        htheme,
-        &status_text,
-        RECT {
-            left: icon_x,
-            top: icon_y + scale_px(22, state.dpi),
-            right: sidebar_w - scale_px(10, state.dpi),
-            bottom: icon_y + scale_px(44, state.dpi),
-        },
-        status_color,
-        DT_LEFT | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
-    );
+    if state.sidebar_anim < 0.35 {
+        draw_composited_text(
+            hdc,
+            htheme,
+            &status_text,
+            RECT {
+                left: hb.right + scale_px(8, state.dpi),
+                top: hb.top,
+                right: sidebar_w - scale_px(10, state.dpi),
+                bottom: hb.bottom,
+            },
+            status_color,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
+        );
+    }
 
     // Draw 7 navigation items
     let item_h = scale_px(44, state.dpi);
-    let start_y = scale_px(85, state.dpi);
+    let start_y = scale_px(NAV_START_Y, state.dpi);
     let margin_x = scale_px(10, state.dpi);
     let item_w = sidebar_w - margin_x * 2;
     let pill_r = scale_px(8, state.dpi);
@@ -5333,56 +6454,51 @@ unsafe fn render_sidebar(
             rest_text
         };
 
+        // Icon centred in the shared icon column (aligned with the rail toggle), label after it;
+        // the label is clipped away as the rail collapses.
         let (t_zh, t_en) = tab.title();
-        let label = format!("{}  {}", tab.icon(), tr(t_zh, t_en));
+        let pill_bottom = iy + item_h - scale_px(4, state.dpi);
+        let icon_col = scale_px(RAIL_ICON_COL_W, state.dpi);
         draw_composited_text(
             hdc,
             htheme,
-            &label,
-            RECT {
-                left: margin_x + scale_px(14, state.dpi),
-                top: iy,
-                right: margin_x + item_w - scale_px(8, state.dpi),
-                bottom: iy + item_h - scale_px(4, state.dpi),
-            },
+            tab.icon(),
+            RECT { left: margin_x, top: iy, right: margin_x + icon_col, bottom: pill_bottom },
             text_color,
-            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
         );
+        let label_left = margin_x + icon_col + scale_px(4, state.dpi);
+        let label_right = margin_x + item_w - scale_px(8, state.dpi);
+        if label_right - label_left > scale_px(12, state.dpi) {
+            draw_composited_text(
+                hdc,
+                htheme,
+                tr(t_zh, t_en),
+                RECT { left: label_left, top: iy, right: label_right, bottom: pill_bottom },
+                text_color,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
+            );
+        }
     }
 
     // Animated Win11 Left vertical accent pill indicator
+    // Drawn straight into the premultiplied surface (anti-aliased, fully opaque). Painting it with
+    // GDI and then stamping its bounding box opaque turned the translucent hover pill pixels
+    // around it into a dark outline.
     let accent_bgr = accent_base_bgr();
-    let bar_brush = CreateSolidBrush(windows::Win32::Foundation::COLORREF(accent_bgr));
-    let bar_pen = CreatePen(PS_SOLID, 1, windows::Win32::Foundation::COLORREF(accent_bgr));
-    let old_bb = SelectObject(hdc, bar_brush);
-    let old_bp = SelectObject(hdc, bar_pen);
     let half_h = state.indicator_h / 2.0;
     let top_y = (state.indicator_y - half_h).round() as i32;
     let bot_y = (state.indicator_y + half_h).round() as i32;
     let pill_w = scale_px(3, state.dpi);
     let pill_x = margin_x + scale_px(3, state.dpi);
-    let _ = windows::Win32::Graphics::Gdi::RoundRect(
-        hdc,
-        pill_x,
-        top_y,
-        pill_x + pill_w,
-        bot_y,
-        3,
-        3,
-    );
-    SelectObject(hdc, old_bb);
-    SelectObject(hdc, old_bp);
-    DeleteObject(bar_brush);
-    DeleteObject(bar_pen);
-    dib.stamp_opaque_nonzero_rect(pill_x, top_y, pill_x + pill_w + 1, bot_y + 1);
+    dib.fill_rounded_translucent(pill_x, top_y, pill_w, bot_y - top_y, pill_w, accent_bgr, 255, accent_bgr, 0);
 
     // Language switcher at bottom of left sidebar
     let lang_y = win_h - scale_px(50, state.dpi);
-    let lang_x = scale_px(16, state.dpi);
-    let lang_w = sidebar_w - scale_px(32, state.dpi);
-    let lang_h = scale_px(32, state.dpi);
+    let (lang_x, lang_w, _) = lang_button_geom(state, sidebar_w);
+    let lang_h = scale_px(LANG_BTN_H, state.dpi);
 
-    draw_language_button(hdc, dib, state, 105, lang_x, lang_y, lang_w, lang_h);
+    draw_language_button(hdc, dib, htheme, state, 105, lang_x, lang_y, lang_w, lang_h);
 }
 
 unsafe fn render_content(hdc: HDC, state: &AppState, sidebar_w: i32, win_w: i32, win_h: i32) {
@@ -5410,8 +6526,8 @@ unsafe fn render_content(hdc: HDC, state: &AppState, sidebar_w: i32, win_w: i32,
         let _ = windows::Win32::Graphics::Gdi::RoundRect(hdc, content_x, banner_y, content_x + content_w, banner_y + banner_h, 8, 8);
         SelectObject(hdc, old_b);
         SelectObject(hdc, old_p);
-        DeleteObject(bg);
-        DeleteObject(pen);
+        let _ = DeleteObject(bg);
+        let _ = DeleteObject(pen);
 
         SelectObject(hdc, state.font_small);
         SetTextColor(hdc, windows::Win32::Foundation::COLORREF(th.caution_text));
@@ -5544,8 +6660,8 @@ unsafe fn render_content(hdc: HDC, state: &AppState, sidebar_w: i32, win_w: i32,
             let _ = RoundRect(hdc, track_x, track_y, track_x + scrollbar_w, track_y + track_h, 6, 6);
             SelectObject(hdc, old_b);
             SelectObject(hdc, old_p);
-            DeleteObject(track_brush);
-            DeleteObject(track_pen);
+            let _ = DeleteObject(track_brush);
+            let _ = DeleteObject(track_pen);
 
             // Thumb pill
             let thumb_color = if state.is_dragging_scrollbar {
@@ -5560,8 +6676,8 @@ unsafe fn render_content(hdc: HDC, state: &AppState, sidebar_w: i32, win_w: i32,
             let _ = RoundRect(hdc, track_x + 1, thumb_y, track_x + scrollbar_w - 1, thumb_y + thumb_h, 6, 6);
             SelectObject(hdc, old_tb);
             SelectObject(hdc, old_tp);
-            DeleteObject(thumb_brush);
-            DeleteObject(thumb_pen);
+            let _ = DeleteObject(thumb_brush);
+            let _ = DeleteObject(thumb_pen);
         }
     }
 }
@@ -5600,7 +6716,7 @@ unsafe fn render_archives_page(hdc: HDC, state: &AppState, x: i32, w: i32) {
     let sort_card_y = card2_y + card2_h + scale_px(14, state.dpi);
     let sort_header_h = scale_px(52, state.dpi);
     let sort_card_h = archive_sort_card_height(state.dpi, state.archive_sort_expand_anim);
-    draw_card_container(hdc, state, x, sort_card_y, w, sort_card_h);
+    draw_expander_card_container(hdc, state, x, sort_card_y, w, sort_card_h, state.is_sort_header_hovered);
 
     let sort_hovered = state.is_sort_header_hovered;
     let sort_pressed = state.pressed_expander == Some(0);
@@ -5652,12 +6768,7 @@ unsafe fn render_archives_page(hdc: HDC, state: &AppState, x: i32, w: i32) {
 
     if state.archive_sort_expand_anim > 0.02 {
         let div_y = sort_card_y + sort_header_h;
-        let div_p = CreatePen(PS_SOLID, 1, windows::Win32::Foundation::COLORREF(th.divider));
-        let op = SelectObject(hdc, div_p);
-        let _ = MoveToEx(hdc, x + scale_px(12, state.dpi), div_y, None);
-        let _ = LineTo(hdc, x + w - scale_px(12, state.dpi), div_y);
-        SelectObject(hdc, op);
-        let _ = DeleteObject(div_p);
+        draw_expander_seam(hdc, state, x, div_y, w);
 
         let rgn = CreateRectRgn(x, div_y, x + w, sort_card_y + sort_card_h);
         let _ = SelectClipRgn(hdc, rgn);
@@ -5702,7 +6813,7 @@ unsafe fn render_archives_page(hdc: HDC, state: &AppState, x: i32, w: i32) {
     let anim_val = state.risk_card_expand_anim;
     let risk_card_h = header_h + ((extra_h as f32) * anim_val) as i32;
 
-    draw_card_container(hdc, state, x, risk_card_y, w, risk_card_h);
+    draw_expander_card_container(hdc, state, x, risk_card_y, w, risk_card_h, state.is_risk_header_hovered);
 
     // Optional header hover / press background highlight
     let risk_hovered = state.is_risk_header_hovered;
@@ -5763,12 +6874,7 @@ unsafe fn render_archives_page(hdc: HDC, state: &AppState, x: i32, w: i32) {
     if anim_val > 0.02 {
         // Divider line between header and sub-items
         let div_y = risk_card_y + header_h;
-        let div_p = CreatePen(PS_SOLID, 1, windows::Win32::Foundation::COLORREF(th.divider));
-        let op = SelectObject(hdc, div_p);
-        let _ = MoveToEx(hdc, x + scale_px(12, state.dpi), div_y, None);
-        let _ = LineTo(hdc, x + w - scale_px(12, state.dpi), div_y);
-        SelectObject(hdc, op);
-        let _ = DeleteObject(div_p);
+        draw_expander_seam(hdc, state, x, div_y, w);
 
         // Clip region to prevent overflow during expand/collapse animation
         let rgn = CreateRectRgn(x, div_y, x + w, risk_card_y + risk_card_h);
@@ -6050,8 +7156,8 @@ unsafe fn render_video_page(hdc: HDC, state: &AppState, x: i32, w: i32) {
         "Invokes FFmpeg for duration probing and frame extraction on formats unsupported by the native Windows decoder (such as 10-bit H.264/Hi10P, AV1, VP9, ProRes, custom HEVC profiles, or non-standard MKV/WebM containers).",
     );
     let note_ev = tr(
-        "當檔案總管在隔離模式下僅傳遞串流時，透過本機已安裝之 Everything 索引服務查詢實體檔案路徑以啟用原生解碼管線（僅支援已建立 NTFS 索引之磁碟區）。\n若系統未安裝或未開啟 Everything，將自動切換至本機目錄快取、網址列歷程與使用者資料夾搜尋。",
-        "When Windows Explorer passes streams in isolation mode, queries the locally installed Everything index service to locate the physical file path for native decoding (only supports NTFS-indexed volumes).\nIf Everything is not installed or running, automatically falls back to local directory cache, TypedPaths, and user folder lookup.",
+        "當檔案總管在隔離模式下僅傳遞串流時，透過本機已安裝之 Everything 索引服務查詢實體檔案路徑以啟用原生解碼管線（預設只採用本機磁碟的結果；網路共用資料夾需開啟下方選項）。\n若系統未安裝或未開啟 Everything，將自動切換至本機目錄快取、網址列歷程與使用者資料夾搜尋。",
+        "When Windows Explorer passes streams in isolation mode, queries the locally installed Everything index service to locate the physical file path for native decoding (local drives only by default; enable the option below for network shares).\nIf Everything is not installed or running, automatically falls back to local directory cache, TypedPaths, and user folder lookup.",
     );
 
     SelectObject(hdc, state.font_small);
@@ -6061,24 +7167,39 @@ unsafe fn render_video_page(hdc: HDC, state: &AppState, x: i32, w: i32) {
     let _ = DrawTextW(hdc, &mut nw_calc, &mut rect_note_calc, DT_CALCRECT | DT_LEFT | DT_WORDBREAK | DT_NOPREFIX);
     let note_ff_h = (rect_note_calc.bottom - rect_note_calc.top).max(scale_px(16, state.dpi));
 
-    let mut rect_ev_calc = RECT { left: 0, top: 0, right: note_max_w, bottom: 0 };
-    let mut ev_calc = to_wide(note_ev);
-    let _ = DrawTextW(hdc, &mut ev_calc, &mut rect_ev_calc, DT_CALCRECT | DT_LEFT | DT_WORDBREAK | DT_NOPREFIX);
-    let note_ev_h = (rect_ev_calc.bottom - rect_ev_calc.top).max(scale_px(16, state.dpi));
 
     let btn_h = scale_px(30, state.dpi);
     let ff_btn_y = card_tools_y + scale_px(40, state.dpi);
     let ff_note_top = ff_btn_y + btn_h + scale_px(8, state.dpi);
-    let tools_div_y = ff_note_top + note_ff_h + scale_px(14, state.dpi);
-    let ev_title_y = tools_div_y + scale_px(14, state.dpi);
-    let btn_rf_y = tools_div_y + scale_px(40, state.dpi);
-    let ev_note_top = btn_rf_y + btn_h + scale_px(8, state.dpi);
-    let card_tools_h = (ev_note_top + note_ev_h + scale_px(14, state.dpi)) - card_tools_y;
+    let ff_card_h = (ff_note_top + note_ff_h + scale_px(14, state.dpi)) - card_tools_y;
+
+    // Everything search helper: its own expander card right below the FFmpeg card. The network
+    // share settings are its body rows, visible only while expanded.
+    let ev_card_y = card_tools_y + ff_card_h + scale_px(14, state.dpi);
+    let ev_header_h = scale_px(52, state.dpi);
+    let ev_indent = scale_px(EXPANDER_CONTENT_INDENT, state.dpi);
+    let ev_row_x = x + ev_indent;
+    let ev_row_w = w - ev_indent * 2;
+    let ev_note_w = (ev_row_w - scale_px(32, state.dpi)).max(scale_px(100, state.dpi));
+    let mut ev_note_calc = RECT { left: 0, top: 0, right: ev_note_w, bottom: 0 };
+    let mut ev_note_calc_w = to_wide(note_ev);
+    SelectObject(hdc, state.font_small);
+    let _ = DrawTextW(hdc, &mut ev_note_calc_w, &mut ev_note_calc, DT_CALCRECT | DT_LEFT | DT_WORDBREAK | DT_NOPREFIX);
+    let ev_note_h = (ev_note_calc.bottom - ev_note_calc.top).max(scale_px(16, state.dpi));
+    let ev_note_top = ev_card_y + ev_header_h + scale_px(12, state.dpi);
+    let net_rows_y = ev_note_top + ev_note_h + scale_px(12, state.dpi);
+    let ev_body_h = (net_rows_y + net_share_rows_height(state)) - (ev_card_y + ev_header_h);
+    let ev_card_h = ev_header_h + (ev_body_h as f32 * state.ev_expand_anim.clamp(0.0, 1.0)).round() as i32;
+    let btn_rf_y = ev_card_y + scale_px(13, state.dpi);
 
     // Layout feedback for hit-testing; `Cell` because rendering only borrows the state immutably.
+    // `video_card_tools_h` spans both cards so the cards below keep their positions.
+    let card_tools_h = (ev_card_y + ev_card_h) - card_tools_y;
     state.video_card_tools_h.set(card_tools_h);
+    state.video_ev_card_rel_y.set(ev_card_y - card_tools_y);
     state.video_everything_btn_rel_y.set(btn_rf_y - card_tools_y);
-    draw_card_container(hdc, state, x, card_tools_y, w, card_tools_h);
+    state.video_net_sub_rel_y.set(net_rows_y - card_tools_y);
+    draw_card_container(hdc, state, x, card_tools_y, w, ff_card_h);
 
     // Section A: FFmpeg Component Path
     let th = theme();
@@ -6189,24 +7310,45 @@ unsafe fn render_video_page(hdc: HDC, state: &AppState, x: i32, w: i32) {
     let mut nw_draw = to_wide(note_ff);
     let _ = DrawTextW(hdc, &mut nw_draw, &mut note_rect, DT_LEFT | DT_WORDBREAK | DT_NOPREFIX);
 
-    // Divider line between FFmpeg & Everything
-    draw_divider_line(hdc, x + scale_px(16, state.dpi), x + w - scale_px(16, state.dpi), tools_div_y);
-
-    // Section B: Everything Search Helper
+    // Card: Everything Search Helper (expander)
     let th = theme();
-    SelectObject(hdc, state.font_bold);
-    SetTextColor(hdc, windows::Win32::Foundation::COLORREF(th.text_primary));
-    let t_ev = to_wide(tr("Everything 搜尋輔助", "Everything Search Helper"));
-    let _ = TextOutW(hdc, x + scale_px(16, state.dpi), ev_title_y, &t_ev);
+    draw_expander_card_container(hdc, state, x, ev_card_y, w, ev_card_h, state.is_ev_header_hovered);
+    let ev_hovered = state.is_ev_header_hovered;
+    let ev_pressed = state.pressed_expander == Some(3);
+    if ev_hovered || ev_pressed {
+        draw_collapsible_header_hover(
+            hdc,
+            state,
+            x,
+            ev_card_y,
+            w,
+            ev_header_h,
+            ev_card_h,
+            state.ev_expand_anim > 0.02,
+            ev_hovered,
+            ev_pressed,
+            state.pressed_expander_anim,
+        );
+    }
 
+    let chevron_w = scale_px(22, state.dpi);
+    let chevron_x = x + w - chevron_w - scale_px(16, state.dpi);
     let btn_rf_w = scale_px(100, state.dpi);
-    let btn_rf_x = x + w - scale_px(16, state.dpi) - btn_rf_w;
-    draw_rounded_button(hdc, state, 342, btn_rf_x, btn_rf_y, btn_rf_w, btn_h, tr("🔄 重新整理", "Refresh"), false, false);
+    let btn_rf_h = scale_px(26, state.dpi);
+    let btn_rf_x = chevron_x - btn_rf_w - scale_px(14, state.dpi);
+    draw_rounded_button(hdc, state, 342, btn_rf_x, btn_rf_y, btn_rf_w, btn_rf_h, tr("🔄 重新整理", "Refresh"), false, false);
 
-    let ev_box_x = x + scale_px(16, state.dpi);
-    let ev_box_w = (btn_rf_x - ev_box_x - scale_px(10, state.dpi)).max(scale_px(150, state.dpi));
-    let ev_box_y = btn_rf_y;
-    let ev_box_h = btn_h;
+    SelectObject(hdc, state.font_bold);
+    let ev_title_col = if ev_pressed {
+        lerp_color(th.text_primary, th.text_muted, state.pressed_expander_anim.clamp(0.0, 1.0))
+    } else {
+        th.text_primary
+    };
+    SetTextColor(hdc, windows::Win32::Foundation::COLORREF(ev_title_col));
+    let ev_title = tr("Everything 搜尋輔助", "Everything Search Helper");
+    let ev_title_w = to_wide(ev_title);
+    let _ = TextOutW(hdc, x + scale_px(16, state.dpi), btn_rf_y + scale_px(3, state.dpi), &ev_title_w);
+    let title_px = text_width(hdc, ev_title);
 
     let ev_ver_opt = {
         let mut cache = state.cached_everything_version.borrow_mut();
@@ -6215,55 +7357,52 @@ unsafe fn render_video_page(hdc: HDC, state: &AppState, x: i32, w: i32) {
         }
         cache.as_ref().and_then(|v| v.clone())
     };
-    let (ev_status_text, ev_border_color, ev_text_color) = if let Some(ver) = ev_ver_opt {
+    let (ev_status_text, ev_status_col) = if let Some(ver) = ev_ver_opt {
         (
-            if matches!(current_lang(), UiLang::En) {
-                format!("Everything {ver} service active")
-            } else {
-                format!("Everything {ver} 服務運作中")
-            },
-            th.input_border,
-            th.text_primary,
+            if matches!(current_lang(), UiLang::En) { format!("Everything {ver} service active") } else { format!("Everything {ver} 服務運作中") },
+            th.status_ok,
         )
     } else {
         (
-            tr("未偵測到運作中之 Everything 服務 (使用目錄快取與歷程比對)", "No active Everything service detected (using folder cache & history)").to_string(),
-            th.input_border,
+            tr("未偵測到 Everything（使用目錄快取與歷程比對）", "Everything not detected (folder cache & history)").to_string(),
             th.text_muted,
         )
     };
-
-    let ev_bg = CreateSolidBrush(windows::Win32::Foundation::COLORREF(th.input_bg));
-    let ev_pen = CreatePen(PS_SOLID, 1, windows::Win32::Foundation::COLORREF(ev_border_color));
-    let old_eb = SelectObject(hdc, ev_bg);
-    let old_ep = SelectObject(hdc, ev_pen);
-    let _ = RoundRect(hdc, ev_box_x, ev_box_y, ev_box_x + ev_box_w, ev_box_y + ev_box_h, r_box, r_box);
-    SelectObject(hdc, old_eb);
-    SelectObject(hdc, old_ep);
-    let _ = DeleteObject(ev_bg);
-    let _ = DeleteObject(ev_pen);
-
-    SelectObject(hdc, state.font_regular);
-    SetTextColor(hdc, windows::Win32::Foundation::COLORREF(ev_text_color));
+    SelectObject(hdc, state.font_small);
+    SetTextColor(hdc, windows::Win32::Foundation::COLORREF(ev_status_col));
     let mut ev_status_w = to_wide(&ev_status_text);
     let mut ev_status_rect = RECT {
-        left: ev_box_x + scale_px(10, state.dpi),
-        top: ev_box_y,
-        right: ev_box_x + ev_box_w - scale_px(10, state.dpi),
-        bottom: ev_box_y + ev_box_h,
+        left: x + scale_px(16, state.dpi) + title_px + scale_px(16, state.dpi),
+        top: ev_card_y,
+        right: btn_rf_x - scale_px(12, state.dpi),
+        bottom: ev_card_y + ev_header_h,
     };
-    let _ = DrawTextW(hdc, &mut ev_status_w, &mut ev_status_rect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    let _ = DrawTextW(hdc, &mut ev_status_w, &mut ev_status_rect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
 
-    SelectObject(hdc, state.font_small);
-    SetTextColor(hdc, windows::Win32::Foundation::COLORREF(th.text_dim));
-    let mut note_ev_rect = RECT {
-        left: x + scale_px(18, state.dpi),
-        top: ev_note_top,
-        right: x + scale_px(18, state.dpi) + note_max_w,
-        bottom: ev_note_top + note_ev_h,
-    };
-    let mut nw_ev_draw = to_wide(note_ev);
-    let _ = DrawTextW(hdc, &mut nw_ev_draw, &mut note_ev_rect, DT_LEFT | DT_WORDBREAK | DT_NOPREFIX);
+    let ch_col = if state.is_ev_expanded { accent_light_bgr() } else { th.text_muted };
+    draw_chevron(hdc, state, chevron_x + chevron_w / 2, ev_card_y + ev_header_h / 2, state.is_ev_expanded, ch_col);
+
+    if state.ev_expand_anim > 0.02 {
+        draw_expander_seam(hdc, state, x, ev_card_y + ev_header_h, w);
+        let rgn = CreateRectRgn(x - 2, ev_card_y + ev_header_h + 1, x + w + 2, ev_card_y + ev_card_h + 2);
+        let _ = SelectClipRgn(hdc, rgn);
+
+        SelectObject(hdc, state.font_small);
+        SetTextColor(hdc, windows::Win32::Foundation::COLORREF(th.text_dim));
+        let mut note_ev_rect = RECT {
+            left: ev_row_x + scale_px(16, state.dpi),
+            top: ev_note_top,
+            right: ev_row_x + scale_px(16, state.dpi) + ev_note_w,
+            bottom: ev_note_top + ev_note_h,
+        };
+        let mut nw_ev_draw = to_wide(note_ev);
+        let _ = DrawTextW(hdc, &mut nw_ev_draw, &mut note_ev_rect, DT_LEFT | DT_WORDBREAK | DT_NOPREFIX);
+
+        render_net_share_rows(hdc, state, x, w, ev_row_x, net_rows_y, ev_row_w);
+
+        let _ = SelectClipRgn(hdc, HRGN::default());
+        let _ = DeleteObject(rgn);
+    }
 
     // Card 3: Independent Border Style & Live Preview (Video corner badge removed)
     let card3_y = card_tools_y + card_tools_h + scale_px(14, state.dpi);
@@ -6317,7 +7456,7 @@ unsafe fn render_video_page(hdc: HDC, state: &AppState, x: i32, w: i32) {
     let card4_y = card_hdr_y + card_hdr_h + scale_px(14, state.dpi);
     let header_h = scale_px(52, state.dpi);
     let card4_h = video_card4_height(state.dpi, state.video_params_expand_anim);
-    draw_card_container(hdc, state, x, card4_y, w, card4_h);
+    draw_expander_card_container(hdc, state, x, card4_y, w, card4_h, state.is_video_params_header_hovered);
 
     let vp_hovered = state.is_video_params_header_hovered;
     let vp_pressed = state.pressed_expander == Some(2);
@@ -6385,9 +7524,17 @@ unsafe fn render_video_page(hdc: HDC, state: &AppState, x: i32, w: i32) {
     if state.video_params_expand_anim > 0.02 {
     // Divider Line 1
     let div1_y = card4_y + header_h;
-    let rgn = CreateRectRgn(x, div1_y, x + w, card4_y + card4_h);
+    let rgn = CreateRectRgn(x - 2, div1_y, x + w + 2, card4_y + card4_h + 2);
     let _ = SelectClipRgn(hdc, rgn);
-    draw_divider_line(hdc, x + scale_px(16, state.dpi), x + w - scale_px(16, state.dpi), div1_y);
+    let _ = SelectClipRgn(hdc, None);
+    draw_expander_seam(hdc, state, x, div1_y, w);
+    let _ = SelectClipRgn(hdc, rgn);
+
+    // Expander body rows are inset from both card edges; seams still cut the full card width.
+    let (card_x, card_w) = (x, w);
+    let indent = scale_px(EXPANDER_CONTENT_INDENT, state.dpi);
+    let x = x + indent;
+    let w = w - indent * 2;
 
     // Section 1: Frame selection policy
     let mut c1_y = div1_y + scale_px(10, state.dpi);
@@ -6461,7 +7608,7 @@ unsafe fn render_video_page(hdc: HDC, state: &AppState, x: i32, w: i32) {
 
     // Divider Line 2
     let div2_y = c1_y + scale_px(10, state.dpi);
-    draw_divider_line(hdc, x + scale_px(16, state.dpi), x + w - scale_px(16, state.dpi), div2_y);
+    draw_expander_seam(hdc, state, card_x, div2_y, card_w);
 
     // Section 2: Mean Luminance Filter
     let mut c2_y = div2_y + scale_px(8, state.dpi);
@@ -6477,7 +7624,7 @@ unsafe fn render_video_page(hdc: HDC, state: &AppState, x: i32, w: i32) {
 
     // Divider Line 3
     let div3_y = c2_y;
-    draw_divider_line(hdc, x + scale_px(16, state.dpi), x + w - scale_px(16, state.dpi), div3_y);
+    draw_expander_seam(hdc, state, card_x, div3_y, card_w);
 
     // Section 3: Shannon Entropy Filter
     let mut c3_y = div3_y + scale_px(8, state.dpi);
@@ -6595,23 +7742,8 @@ unsafe fn render_other_page(hdc: HDC, state: &AppState, x: i32, w: i32) {
     let is_editing = state.active_edit == Some(EditTarget::CustomTextExtensions);
     let (mx, my) = state.mouse_pos;
     let is_hovered = mx >= box_x && mx <= box_x + box_w && my >= box_y && my <= box_y + box_h;
-    let (fill_col, border_col) = if is_editing {
-        (th.input_bg, accent_base_bgr())
-    } else if is_hovered {
-        (th.btn_hover_bg, th.btn_hover_border)
-    } else {
-        (th.input_bg, th.input_border)
-    };
-    let box_bg = CreateSolidBrush(windows::Win32::Foundation::COLORREF(fill_col));
-    let box_pen = CreatePen(PS_SOLID, 1, windows::Win32::Foundation::COLORREF(border_col));
-    let ob = SelectObject(hdc, box_bg);
-    let op = SelectObject(hdc, box_pen);
-    let r_box = scale_px(6, state.dpi);
-    let _ = RoundRect(hdc, box_x, box_y, box_x + box_w, box_y + box_h, r_box, r_box);
-    SelectObject(hdc, ob);
-    SelectObject(hdc, op);
-    let _ = DeleteObject(box_bg);
-    let _ = DeleteObject(box_pen);
+    draw_win11_textbox_frame(hdc, state, box_x, box_y, box_w, box_h, is_editing, is_hovered, false);
+    let show_clear = is_editing && !state.edit_buffer.is_empty();
 
     let display_val = if is_editing {
         state.edit_buffer.as_str()
@@ -6620,26 +7752,18 @@ unsafe fn render_other_page(hdc: HDC, state: &AppState, x: i32, w: i32) {
     };
     SelectObject(hdc, state.font_regular);
     SetTextColor(hdc, windows::Win32::Foundation::COLORREF(th.text_primary));
-    let mut txt_rc = RECT {
-        left: box_x + scale_px(10, state.dpi),
-        top: box_y,
-        right: box_x + box_w - scale_px(10, state.dpi),
-        bottom: box_y + box_h,
-    };
-    let mut txt_w = to_wide(display_val);
-    let _ = DrawTextW(hdc, &mut txt_w, &mut txt_rc, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
-
-    if is_editing {
-        let mut sz = windows::Win32::Foundation::SIZE::default();
-        let raw_w: Vec<u16> = display_val.encode_utf16().collect();
-        let _ = windows::Win32::Graphics::Gdi::GetTextExtentPoint32W(hdc, &raw_w, &mut sz);
-        let caret_x = (txt_rc.left + sz.cx + 1).min(txt_rc.right - 2);
-        let caret_p = CreatePen(PS_SOLID, 1, windows::Win32::Foundation::COLORREF(th.text_primary));
-        let ocp = SelectObject(hdc, caret_p);
-        let _ = MoveToEx(hdc, caret_x, box_y + scale_px(6, state.dpi), None);
-        let _ = LineTo(hdc, caret_x, box_y + box_h - scale_px(6, state.dpi));
-        SelectObject(hdc, ocp);
-        let _ = DeleteObject(caret_p);
+    let txt_right = box_x + box_w - if show_clear { textbox_clear_w(state) + scale_px(4, state.dpi) } else { scale_px(10, state.dpi) };
+    let txt_left = box_x + scale_px(10, state.dpi);
+    state.edit_boxes.borrow_mut().push(EditBoxGeom {
+        target: EditTarget::CustomTextExtensions,
+        rect: RECT { left: box_x, top: box_y, right: box_x + box_w, bottom: box_y + box_h },
+        text_left: txt_left,
+        text_right: txt_right,
+        font: state.font_regular,
+    });
+    draw_edit_text(hdc, state, state.font_regular, display_val, th.text_primary, txt_left, txt_right, box_y, box_h, is_editing);
+    if show_clear {
+        draw_textbox_clear_button(hdc, state, box_x, box_y, box_w, box_h);
     }
 
     let is_applied = state.applied_custom_timer.map_or(false, |t| t.elapsed().as_secs_f32() < 1.5);
@@ -6935,7 +8059,26 @@ unsafe fn render_advanced_page(hdc: HDC, state: &AppState, x: i32, w: i32) {
     draw_rounded_button(hdc, state, 300, btn1_x, btn_y, btn_w, btn_h, tr("清理縮圖快取", "Clear Cache"), false, false);
 
     let btn2_x = btn1_x + btn_w + btn_gap;
-    draw_rounded_button(hdc, state, 301, btn2_x, btn_y, btn_w, btn_h, tr("填充縮圖快取", "Fill Cache"), false, false);
+    let fill_label = if state.prewarm.is_active() { tr("■ 停止產生", "■ Stop") } else { tr("📁 預先產生縮圖", "📁 Pre-generate") };
+    draw_rounded_button(hdc, state, 301, btn2_x, btn_y, btn_w, btn_h, fill_label, false, false);
+
+    // Title-row extras: drop hint and the pre-generation size selector.
+    let (size_x, size_y, size_w, size_h) = prewarm_size_button_geom(state, x, w, card1_y);
+    let size_label = format!("{} {} px", tr("縮圖尺寸", "Size"), state.prewarm_size);
+    draw_subtle_button(hdc, state, 303, size_x, size_y, size_w, size_h, &size_label, state.prewarm.is_active());
+    SelectObject(hdc, state.font_small);
+    SetTextColor(hdc, windows::Win32::Foundation::COLORREF(th.text_secondary));
+    let mut hint_rc = RECT {
+        left: x + scale_px(190, state.dpi),
+        top: card1_y + scale_px(16, state.dpi),
+        right: size_x - scale_px(8, state.dpi),
+        bottom: card1_y + scale_px(36, state.dpi),
+    };
+    let mut hint_w = to_wide(tr(
+        "將資料夾拖曳到此頁，可多執行緒預先產生縮圖（含 3 層子資料夾）",
+        "Drop a folder on this page to pre-generate thumbnails in parallel (3 sub-folder levels)",
+    ));
+    let _ = DrawTextW(hdc, &mut hint_w, &mut hint_rc, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
 
     let btn3_x = btn2_x + btn_w + btn_gap;
     let btn3_w = scale_px(195, state.dpi);
@@ -6951,9 +8094,15 @@ unsafe fn render_advanced_page(hdc: HDC, state: &AppState, x: i32, w: i32) {
 
     SelectObject(hdc, state.font_small);
     SetTextColor(hdc, windows::Win32::Foundation::COLORREF(th.status_ok));
-    let status_str = state.get_cache_status_display();
-    let status_w = to_wide(&status_str);
-    let _ = TextOutW(hdc, chk2_x + scale_px(160, state.dpi), chk_y + scale_px(2, state.dpi), &status_w);
+    let status_str = if state.prewarm_shown { prewarm_status_text(state) } else { state.get_cache_status_display() };
+    let mut status_w = to_wide(&status_str);
+    let mut status_rc = RECT {
+        left: chk2_x + scale_px(160, state.dpi),
+        top: chk_y + scale_px(2, state.dpi),
+        right: x + w - scale_px(16, state.dpi),
+        bottom: chk_y + scale_px(22, state.dpi),
+    };
+    let _ = DrawTextW(hdc, &mut status_w, &mut status_rc, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
 
     // Card 2: Live Activity Monitor (即時縮圖運作監視器)
     let card2_y = card1_y + card1_h + scale_px(14, state.dpi);
@@ -6974,9 +8123,14 @@ unsafe fn render_advanced_page(hdc: HDC, state: &AppState, x: i32, w: i32) {
     let sw_card_w = scale_px(210, state.dpi);
     let sw_x = x + w - sw_card_w;
     draw_row_toggle(hdc, state, 99, sw_x, card2_y + scale_px(8, state.dpi), sw_card_w, tr("記錄運作日誌", "Enable Logging"), mon_enabled, false);
+    let (lock_x, lock_w) = monitor_lock_button_geom(state, sw_x);
+    let lock_label = monitor_lock_label(&state.settings);
+    draw_subtle_button(hdc, state, 97, lock_x, card2_y + scale_px(8, state.dpi), lock_w, scale_px(24, state.dpi), &lock_label, !mon_enabled);
 
     // Only render log contents if expanded
     if state.monitor_expand_anim > 0.02 {
+        // Card-style seam between the header row and the log, like the expander cards.
+        draw_expander_seam(hdc, state, x, card2_y + header_h, w);
         let rgn = CreateRectRgn(x, card2_y + header_h, x + w, card2_y + card2_h);
         let _ = SelectClipRgn(hdc, rgn);
         render_live_monitor_widget(hdc, state, x, card2_y, w, header_h, card2_h);
@@ -6998,7 +8152,31 @@ unsafe fn render_advanced_page(hdc: HDC, state: &AppState, x: i32, w: i32) {
 
     // Card 3: Drag & Drop Experiment Area
     let drop_y = card2_y + card2_h + scale_px(14, state.dpi);
-    let drop_h = scale_px(175, state.dpi);
+
+    // Lay out the result text first (word-wrapped to the left of the preview box) so the card can
+    // grow to fit long messages such as decoder errors instead of cutting them off.
+    let prev_w = scale_px(140, state.dpi);
+    let prev_h = scale_px(140, state.dpi);
+    let prev_x = x + w - prev_w - scale_px(16, state.dpi);
+    let text_left = x + scale_px(16, state.dpi);
+    let text_right = (prev_x - scale_px(12, state.dpi)).max(text_left + scale_px(80, state.dpi));
+    let line_gap = scale_px(1, state.dpi);
+    let min_line_h = scale_px(18, state.dpi);
+    let wrap_flags = DT_LEFT | DT_WORDBREAK | DT_EDITCONTROL | DT_NOPREFIX;
+    let metrics_text = state.get_test_metrics_display();
+    SelectObject(hdc, state.font_regular);
+    let mut line_layout: Vec<(Vec<u16>, i32)> = Vec::new();
+    let mut text_bottom = drop_y + scale_px(52, state.dpi);
+    for line in metrics_text.lines() {
+        let mut lw = to_wide(line);
+        let mut calc = RECT { left: text_left, top: 0, right: text_right, bottom: 0 };
+        let _ = DrawTextW(hdc, &mut lw, &mut calc, wrap_flags | DT_CALCRECT);
+        let lh = (calc.bottom - calc.top).max(min_line_h);
+        line_layout.push((lw, lh));
+        text_bottom += lh + line_gap;
+    }
+    let drop_h = (text_bottom - drop_y + scale_px(14, state.dpi)).max(scale_px(175, state.dpi));
+    state.drop_card_h.set(drop_h);
     draw_card_container(hdc, state, x, drop_y, w, drop_h);
 
     let th = theme();
@@ -7013,9 +8191,6 @@ unsafe fn render_advanced_page(hdc: HDC, state: &AppState, x: i32, w: i32) {
     let _ = TextOutW(hdc, x + scale_px(16, state.dpi), drop_y + scale_px(32, state.dpi), &hint_w);
 
     // Right Side: Live Thumbnail Preview Box
-    let prev_w = scale_px(140, state.dpi);
-    let prev_h = scale_px(140, state.dpi);
-    let prev_x = x + w - prev_w - scale_px(16, state.dpi);
     let prev_y = drop_y + scale_px(18, state.dpi);
 
     // "Update this file's thumbnail" button (ID 309) to the left of preview box
@@ -7073,20 +8248,14 @@ unsafe fn render_advanced_page(hdc: HDC, state: &AppState, x: i32, w: i32) {
     }
 
     // Left Side: Metrics text (constrained to left of preview box)
-    let metrics_text = state.get_test_metrics_display();
     if !metrics_text.is_empty() {
         SelectObject(hdc, state.font_regular);
         SetTextColor(hdc, windows::Win32::Foundation::COLORREF(accent_light_bgr()));
-        let lines: Vec<&str> = metrics_text.lines().collect();
-        for (i, line) in lines.iter().enumerate() {
-            let mut lw = to_wide(line);
-            let mut lr = RECT {
-                left: x + scale_px(16, state.dpi),
-                top: drop_y + scale_px(52 + i as i32 * 19, state.dpi),
-                right: prev_x - scale_px(12, state.dpi),
-                bottom: drop_y + scale_px(52 + i as i32 * 19 + 18, state.dpi),
-            };
-            let _ = DrawTextW(hdc, &mut lw, &mut lr, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+        let mut ly = drop_y + scale_px(52, state.dpi);
+        for (mut lw, lh) in line_layout {
+            let mut lr = RECT { left: text_left, top: ly, right: text_right, bottom: ly + lh };
+            let _ = DrawTextW(hdc, &mut lw, &mut lr, wrap_flags);
+            ly += lh + line_gap;
         }
     } else {
         SelectObject(hdc, state.font_regular);
@@ -7283,14 +8452,17 @@ unsafe fn render_live_monitor_widget(
     let clr_w = scale_px(85, state.dpi);
     let clr_h = scale_px(20, state.dpi);
     let clr_x = card_x + card_w - pad_x - clr_w;
-    draw_rounded_button(hdc, state, 304, clr_x, metrics_y, clr_w, clr_h, tr("🗑 清除記錄", "Clear Log"), false, !mon_enabled);
+    draw_subtle_button(hdc, state, 304, clr_x, metrics_y, clr_w, clr_h, tr("🗑 清除記錄", "🗑 Clear Log"), !mon_enabled);
+    let exp_w = scale_px(85, state.dpi);
+    let exp_x = clr_x - scale_px(6, state.dpi) - exp_w;
+    draw_subtle_button(hdc, state, 306, exp_x, metrics_y, exp_w, clr_h, tr("📄 匯出記錄", "📄 Export"), !mon_enabled);
 
-    // 2 Dropdown Filter Buttons on left of clear button (matching language selector style)
+    // 2 Dropdown Filter Buttons on left of the log actions (matching language selector style)
     let dd_h = scale_px(20, state.dpi);
     let dd_gap = scale_px(6, state.dpi);
     let status_dd_w = scale_px(98, state.dpi);
     let pipe_dd_w = scale_px(104, state.dpi);
-    let status_dd_x = clr_x - scale_px(10, state.dpi) - status_dd_w;
+    let status_dd_x = exp_x - scale_px(17, state.dpi) - status_dd_w;
     let pipe_dd_x = status_dd_x - dd_gap - pipe_dd_w;
 
     state.monitor_dropdown_anchor.set((pipe_dd_x, status_dd_x, metrics_y, dd_h));
@@ -7311,6 +8483,15 @@ unsafe fn render_live_monitor_widget(
 
     draw_monitor_dropdown_button(hdc, state, pipe_dd_x, metrics_y, pipe_dd_w, dd_h, pipe_label, state.open_monitor_dropdown == Some(0), state.pressed_monitor_dropdown == Some(0), !mon_enabled);
     draw_monitor_dropdown_button(hdc, state, status_dd_x, metrics_y, status_dd_w, dd_h, status_label, state.open_monitor_dropdown == Some(1), state.pressed_monitor_dropdown == Some(1), !mon_enabled);
+
+    // Group separator between the filters and the log action (command-bar style).
+    let sep_x = (status_dd_x + status_dd_w + exp_x) / 2;
+    let sep_pen = CreatePen(PS_SOLID, 1, windows::Win32::Foundation::COLORREF(theme().divider));
+    let old_sp = SelectObject(hdc, sep_pen);
+    let _ = MoveToEx(hdc, sep_x, metrics_y, None);
+    let _ = LineTo(hdc, sep_x, metrics_y + dd_h);
+    SelectObject(hdc, old_sp);
+    let _ = DeleteObject(sep_pen);
 
     // History Table Header: 6 columns (Time | Type | Duration | File Name | Pipeline | Status) — Win11 Task Manager style
     let table_y = metrics_y + scale_px(24, state.dpi);
@@ -7530,6 +8711,38 @@ unsafe fn render_live_monitor_widget(
     }
 }
 
+/// Background of a borderless command-bar ("subtle") button: nothing at rest, a fill on hover /
+/// open, a slightly darker fill while pressed. Drawn 2 px taller than the hit row on both sides.
+unsafe fn draw_subtle_button_bg(hdc: HDC, state: &AppState, x: i32, y: i32, w: i32, h: i32, hovered: bool, pressed: bool, open: bool) {
+    let th = theme();
+    let fill = if pressed {
+        Some(lerp_color(th.card_bg, th.btn_hover_bg, 0.55))
+    } else if hovered || open {
+        Some(th.btn_hover_bg)
+    } else {
+        None
+    };
+    if let Some(col) = fill {
+        let pad = scale_px(2, state.dpi);
+        let r = scale_px(8, state.dpi);
+        let br = CreateSolidBrush(windows::Win32::Foundation::COLORREF(col));
+        let pen = CreatePen(PS_SOLID, 1, windows::Win32::Foundation::COLORREF(col));
+        let ob = SelectObject(hdc, br);
+        let op = SelectObject(hdc, pen);
+        let _ = RoundRect(hdc, x, y - pad, x + w, y + h + pad, r, r);
+        SelectObject(hdc, ob);
+        SelectObject(hdc, op);
+        let _ = DeleteObject(br);
+        let _ = DeleteObject(pen);
+    }
+}
+
+fn is_mouse_over(state: &AppState, x: i32, y: i32, w: i32, h: i32) -> bool {
+    state.mouse_pos.0 >= x && state.mouse_pos.0 <= x + w && state.mouse_pos.1 >= y && state.mouse_pos.1 <= y + h
+}
+
+/// Monitor filter trigger: borderless command-bar button with the current choice and a chevron.
+#[allow(clippy::too_many_arguments)]
 unsafe fn draw_monitor_dropdown_button(
     hdc: HDC,
     state: &AppState,
@@ -7542,35 +8755,20 @@ unsafe fn draw_monitor_dropdown_button(
     is_pressed: bool,
     disabled: bool,
 ) {
-    let r = scale_px(5, state.dpi);
-    let is_hovered = !disabled
-        && state.mouse_pos.0 >= x
-        && state.mouse_pos.0 <= x + w
-        && state.mouse_pos.1 >= y
-        && state.mouse_pos.1 <= y + h;
     let th = theme();
-    let (bg_color, border_color, text_color) = if disabled {
-        (th.btn_disabled_bg, th.btn_disabled_border, th.text_disabled)
+    let is_hovered = !disabled && is_mouse_over(state, x, y, w, h);
+    if !disabled {
+        draw_subtle_button_bg(hdc, state, x, y, w, h, is_hovered, is_pressed, is_open);
+    }
+    let text_color = if disabled {
+        th.text_disabled
     } else if is_pressed {
-        (th.sub_card_bg, th.btn_hover_border, th.text_primary)
-    } else if is_open {
-        (th.btn_hover_bg, accent_base_bgr(), th.text_bright)
-    } else if is_hovered {
-        (th.btn_hover_bg, th.btn_hover_border, th.text_bright)
+        th.text_secondary
+    } else if is_open || is_hovered {
+        th.text_bright
     } else {
-        (th.btn_bg, th.btn_border, th.text_secondary)
+        th.text_primary
     };
-
-    let bg = CreateSolidBrush(windows::Win32::Foundation::COLORREF(bg_color));
-    let pen = CreatePen(PS_SOLID, 1, windows::Win32::Foundation::COLORREF(border_color));
-    let old_b = SelectObject(hdc, bg);
-    let old_p = SelectObject(hdc, pen);
-    let _ = RoundRect(hdc, x, y, x + w, y + h, r, r);
-    SelectObject(hdc, old_b);
-    SelectObject(hdc, old_p);
-    let _ = DeleteObject(bg);
-    let _ = DeleteObject(pen);
-
     SelectObject(hdc, state.font_small);
     SetTextColor(hdc, windows::Win32::Foundation::COLORREF(text_color));
     let mut lw = to_wide(label);
@@ -7588,119 +8786,426 @@ unsafe fn draw_monitor_dropdown_button(
     draw_chevron(hdc, state, arrow_cx, arrow_cy, is_open, arrow_col);
 }
 
-unsafe fn draw_monitor_dropdown_flyout(hdc: HDC, state: &AppState) {
-    let Some(dd_kind) = state.open_monitor_dropdown else {
-        return;
-    };
-    let (pipe_x, status_x, btn_y, btn_h) = state.monitor_dropdown_anchor.get();
-    if btn_h <= 0 {
-        return;
-    }
-    let (menu_x, menu_w, options): (i32, i32, Vec<(&str, bool)>) = if dd_kind == 0 {
-        (
-            pipe_x,
-            scale_px(114, state.dpi),
-            vec![
-                (tr("全部管道", "All Pipelines"), state.monitor_pipeline_filter == MonitorPipelineFilter::All),
-                (tr("檔案直讀", "Direct File"), state.monitor_pipeline_filter == MonitorPipelineFilter::DirectFile),
-                (tr("IPC 命中", "IPC Hit"), state.monitor_pipeline_filter == MonitorPipelineFilter::IpcHit),
-                (tr("搜尋命中", "Search Hit"), state.monitor_pipeline_filter == MonitorPipelineFilter::SearchHit),
-                (tr("串流 RPC", "Stream RPC"), state.monitor_pipeline_filter == MonitorPipelineFilter::StreamRpc),
-            ],
-        )
-    } else {
-        (
-            status_x,
-            scale_px(108, state.dpi),
-            vec![
-                (tr("全部狀態", "All Status"), state.monitor_filter == MonitorFilter::All),
-                (tr("正常", "OK"), state.monitor_filter == MonitorFilter::Success),
-                (tr("耗時", "Slow"), state.monitor_filter == MonitorFilter::Slow),
-                (tr("中斷/跳過", "Errors"), state.monitor_filter == MonitorFilter::InterruptedOrSkipped),
-            ],
-        )
-    };
-
-    let item_h = scale_px(26, state.dpi);
-    let padding = scale_px(4, state.dpi);
-    let full_menu_h = (options.len() as i32 * item_h) + padding * 2;
-    let anim_val = if state.monitor_dd_anim_start.is_some() { state.monitor_dd_anim } else { 1.0 };
-    let current_h = btn_h + (((full_menu_h - btn_h) as f32) * anim_val) as i32;
-    let menu_top = btn_y;
-    let menu_bottom = menu_top + current_h;
-    let corner_r = scale_px(8, state.dpi);
-
+/// Borderless command-bar button with a centred label (e.g. "Clear Log").
+#[allow(clippy::too_many_arguments)]
+unsafe fn draw_subtle_button(hdc: HDC, state: &AppState, btn_id: u32, x: i32, y: i32, w: i32, h: i32, label: &str, disabled: bool) {
     let th = theme();
-    // Dropdown card background & border (Win11 fluent flyout covering original button)
-    let bg = CreateSolidBrush(windows::Win32::Foundation::COLORREF(th.card_bg));
-    let pen = CreatePen(PS_SOLID, 1, windows::Win32::Foundation::COLORREF(th.btn_border));
-    let old_b = SelectObject(hdc, bg);
-    let old_p = SelectObject(hdc, pen);
-    let _ = RoundRect(hdc, menu_x, menu_top, menu_x + menu_w, menu_bottom, corner_r, corner_r);
-    SelectObject(hdc, old_b);
-    SelectObject(hdc, old_p);
-    let _ = DeleteObject(bg);
-    let _ = DeleteObject(pen);
+    let is_pressed = !disabled && state.pressed_btn == Some(btn_id);
+    let is_hovered = !disabled && is_mouse_over(state, x, y, w, h);
+    if !disabled {
+        draw_subtle_button_bg(hdc, state, x, y, w, h, is_hovered, is_pressed, false);
+    }
+    let text_color = if disabled {
+        th.text_disabled
+    } else if is_pressed {
+        th.text_secondary
+    } else if is_hovered {
+        th.text_bright
+    } else {
+        th.text_primary
+    };
+    SelectObject(hdc, state.font_small);
+    SetTextColor(hdc, windows::Win32::Foundation::COLORREF(text_color));
+    let mut lw = to_wide(label);
+    let mut rc = RECT { left: x, top: y, right: x + w, bottom: y + h };
+    let _ = DrawTextW(hdc, &mut lw, &mut rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+}
 
-    // Clip rendering to menu bounds during extension animation
-    let rgn = CreateRectRgn(menu_x, menu_top, menu_x + menu_w, menu_bottom);
-    let _ = SelectClipRgn(hdc, rgn);
 
-    let item_r = scale_px(5, state.dpi);
-    for (i, (label, is_sel)) in options.iter().enumerate() {
-        let ix = menu_x + padding;
-        let iy = menu_top + padding + (i as i32 * item_h);
-        let iw = menu_w - padding * 2;
-        let is_hov = state.hover_monitor_dropdown_item == Some(i);
-        if is_hov {
-            let h_br = CreateSolidBrush(windows::Win32::Foundation::COLORREF(th.btn_hover_bg));
-            let h_pen = CreatePen(PS_SOLID, 1, windows::Win32::Foundation::COLORREF(th.btn_hover_bg));
-            let ob = SelectObject(hdc, h_br);
-            let op = SelectObject(hdc, h_pen);
-            let _ = RoundRect(hdc, ix, iy, ix + iw, iy + item_h, item_r, item_r);
-            SelectObject(hdc, ob);
-            SelectObject(hdc, op);
-            let _ = DeleteObject(h_br);
-            let _ = DeleteObject(h_pen);
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn prewarm_size_button_geom(state: &AppState, x: i32, w: i32, card_y: i32) -> (i32, i32, i32, i32) {
+    let bw = scale_px(130, state.dpi);
+    (x + w - scale_px(16, state.dpi) - bw, card_y + scale_px(12, state.dpi), bw, scale_px(24, state.dpi))
+}
+
+/// Starts pre-generating thumbnails for `folder` (+ 3 sub-folder levels) into the system cache.
+fn start_prewarm(state: &mut AppState, folder: PathBuf) {
+    if state.prewarm.is_active() {
+        return;
+    }
+    state.prewarm_shown = true;
+    if cbx_core::media::is_network_path(&folder) && !state.cache_include_network {
+        state.cache_status_kind = CacheStatusKind::Custom(format!(
+            "⚠️ {}",
+            tr("網路位置請先勾選「包含網路設備」", "Tick \"Include Network Devices\" for network folders")
+        ));
+        state.prewarm_shown = false;
+        return;
+    }
+    let opts = cbx_core::prewarm::PrewarmOptions {
+        size: state.prewarm_size,
+        force: state.cache_force_refresh,
+        threads: cbx_core::prewarm::default_threads(),
+        max_depth: cbx_core::prewarm::MAX_PREWARM_DEPTH,
+    };
+    state.prewarm_last_done = 0;
+    cbx_core::prewarm::start(folder, opts, std::sync::Arc::clone(&state.prewarm));
+}
+
+fn prewarm_status_text(state: &AppState) -> String {
+    use std::sync::atomic::Ordering::Acquire;
+    let p = &state.prewarm;
+    let total = p.total.load(Acquire);
+    let done = p.done.load(Acquire);
+    let generated = p.generated.load(Acquire);
+    let cached = p.cached.load(Acquire);
+    let failed = p.failed.load(Acquire);
+    if p.scanning.load(Acquire) {
+        let root = p.root.lock().map(|r| r.clone()).unwrap_or_default();
+        return format!("🔎 {} {root}", tr("掃描中…", "Scanning…"));
+    }
+    if p.running.load(Acquire) {
+        let current = p.current.lock().map(|c| c.clone()).unwrap_or_default();
+        return format!(
+            "⏳ {done}/{total}（{} {generated}、{} {cached}、{} {failed}）{current}",
+            tr("新產生", "new"),
+            tr("已在快取", "cached"),
+            tr("失敗", "failed")
+        );
+    }
+    let secs = p.elapsed_ms.load(Acquire) as f64 / 1000.0;
+    let head = if p.cancel.load(Acquire) { tr("⏹ 已停止", "⏹ Stopped") } else { tr("✅ 完成", "✅ Done") };
+    format!(
+        "{head} {done}/{total}：{} {generated}、{} {cached}、{} {failed}（{secs:.1} {}）",
+        tr("新產生", "new"),
+        tr("已在快取", "cached"),
+        tr("失敗", "failed"),
+        tr("秒", "s")
+    )
+}
+
+/// Repaints while a pre-generation run makes progress (and once when it ends).
+unsafe fn prewarm_tick(hwnd: HWND, state: &mut AppState) {
+    let active = state.prewarm.is_active();
+    let done = state.prewarm.done.load(std::sync::atomic::Ordering::Acquire);
+    if (active && done != state.prewarm_last_done) || active != state.prewarm_was_active {
+        state.prewarm_last_done = done;
+        state.prewarm_was_active = active;
+        if state.active_tab == ManagerTab::Advanced {
+            let _ = InvalidateRect(hwnd, None, false);
         }
-        if *is_sel {
-            let pill_x = ix + scale_px(4, state.dpi);
-            let pill_w = scale_px(3, state.dpi);
-            let pill_h = scale_px(14, state.dpi);
-            let pill_y = iy + (item_h - pill_h) / 2;
-            let accent_bgr = accent_base_bgr();
-            let pill_b = CreateSolidBrush(windows::Win32::Foundation::COLORREF(accent_bgr));
-            let pill_p = CreatePen(PS_SOLID, 1, windows::Win32::Foundation::COLORREF(accent_bgr));
-            let ob = SelectObject(hdc, pill_b);
-            let op = SelectObject(hdc, pill_p);
-            let _ = RoundRect(hdc, pill_x, pill_y, pill_x + pill_w, pill_y + pill_h, 3, 3);
-            SelectObject(hdc, ob);
-            SelectObject(hdc, op);
-            let _ = DeleteObject(pill_b);
-            let _ = DeleteObject(pill_p);
-        }
+    }
+}
 
-        SelectObject(hdc, state.font_small);
-        let text_col = if *is_sel {
-            th.text_bright
-        } else if is_hov {
-            th.text_primary
-        } else {
-            th.text_secondary
-        };
-        SetTextColor(hdc, windows::Win32::Foundation::COLORREF(text_col));
-        let mut lw = to_wide(label);
-        let mut trc = RECT {
-            left: ix + scale_px(12, state.dpi),
-            top: iy,
-            right: ix + iw - scale_px(6, state.dpi),
-            bottom: iy + item_h,
-        };
-        let _ = DrawTextW(hdc, &mut lw, &mut trc, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+#[repr(C)]
+struct BrowseInfoW {
+    hwnd_owner: *mut std::ffi::c_void,
+    pidl_root: *const std::ffi::c_void,
+    display_name: *mut u16,
+    title: *const u16,
+    flags: u32,
+    callback: *const std::ffi::c_void,
+    lparam: isize,
+    image: i32,
+}
+
+#[link(name = "shell32")]
+extern "system" {
+    #[link_name = "SHBrowseForFolderW"]
+    fn sh_browse_for_folder_w(bi: *const BrowseInfoW) -> *mut std::ffi::c_void;
+    #[link_name = "SHGetPathFromIDListW"]
+    fn sh_get_path_from_id_list_w(pidl: *const std::ffi::c_void, path: *mut u16) -> i32;
+}
+
+#[link(name = "ole32")]
+extern "system" {
+    #[link_name = "CoTaskMemFree"]
+    fn co_task_mem_free(p: *mut std::ffi::c_void);
+    #[link_name = "CoInitializeEx"]
+    fn co_initialize_ex(reserved: *mut std::ffi::c_void, flags: u32) -> i32;
+}
+
+/// Folder picker for "pre-generate thumbnails".
+unsafe fn pick_folder(hwnd: HWND) -> Option<PathBuf> {
+    const BIF_RETURNONLYFSDIRS: u32 = 0x1;
+    const BIF_NEWDIALOGSTYLE: u32 = 0x40;
+    const COINIT_APARTMENTTHREADED: u32 = 0x2;
+    // The new-style dialog needs an STA; S_FALSE when the UI thread already has one.
+    let _ = co_initialize_ex(std::ptr::null_mut(), COINIT_APARTMENTTHREADED);
+    let mut name = [0u16; 260];
+    let title = to_wide(tr(
+        "選擇要預先產生縮圖的資料夾（含 3 層子資料夾）",
+        "Choose a folder to pre-generate thumbnails for (3 sub-folder levels)",
+    ));
+    let bi = BrowseInfoW {
+        hwnd_owner: hwnd.0,
+        pidl_root: std::ptr::null(),
+        display_name: name.as_mut_ptr(),
+        title: title.as_ptr(),
+        flags: BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE,
+        callback: std::ptr::null(),
+        lparam: 0,
+        image: 0,
+    };
+    let pidl = sh_browse_for_folder_w(&bi);
+    if pidl.is_null() {
+        return None;
+    }
+    let mut path = [0u16; 1024];
+    let ok = sh_get_path_from_id_list_w(pidl, path.as_mut_ptr()) != 0;
+    co_task_mem_free(pidl);
+    if !ok {
+        return None;
+    }
+    let len = path.iter().position(|&c| c == 0).unwrap_or(path.len());
+    Some(PathBuf::from(String::from_utf16_lossy(&path[..len])))
+}
+
+fn monitor_lock_button_geom(state: &AppState, toggle_x: i32) -> (i32, i32) {
+    let w = scale_px(118, state.dpi);
+    (toggle_x - scale_px(8, state.dpi) - w, w)
+}
+
+fn monitor_lock_label(settings: &Settings) -> String {
+    if settings.monitor_locked {
+        return tr("🔒 持續記錄", "🔒 Keep logging").to_string();
+    }
+    match settings.monitor_seconds_left(unix_now()) {
+        Some(left) => {
+            let m = left.div_ceil(60).max(1);
+            if matches!(current_lang(), UiLang::ZhTw) {
+                format!("🔓 剩 {m} 分鐘")
+            } else {
+                format!("🔓 {m} min left")
+            }
+        }
+        None => tr("🔓 10 分鐘", "🔓 10 min").to_string(),
+    }
+}
+
+/// Switches unlocked logging off once its 10-minute window has passed and keeps the
+/// "minutes left" label current.
+unsafe fn monitor_auto_off_tick(hwnd: HWND, state: &mut AppState) {
+    let now = unix_now();
+    if state.settings.monitor_enabled && !state.settings.monitor_effective(now) {
+        state.settings.monitor_enabled = false;
+        state.settings.monitor_locked = false;
+        let _ = state.settings.save();
+        state.monitor_anim_start = Some((std::time::Instant::now(), false));
+        let _ = SetTimer(hwnd, 1, 16, None);
+        trigger_toggle_animation(hwnd, state, 99, false);
+        // History is kept (unlike the manual switch-off) so the log can still be exported.
+        state.monitor_left_min = None;
+        let _ = InvalidateRect(hwnd, None, false);
+        return;
+    }
+    let left = state.settings.monitor_seconds_left(now).map(|s| s.div_ceil(60));
+    if left != state.monitor_left_min {
+        state.monitor_left_min = left;
+        let _ = InvalidateRect(hwnd, None, false);
+    }
+}
+
+fn about_update_card_h(dpi: u32) -> i32 {
+    scale_px(104, dpi)
+}
+
+struct UpdateButton {
+    id: u32,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    label: String,
+    disabled: bool,
+}
+
+/// Buttons of the "Software update" card; shared by painting and hit-testing.
+fn about_update_buttons(state: &AppState, x: i32, w: i32, card_y: i32) -> Vec<UpdateButton> {
+    let dpi = state.dpi;
+    let phase = updater::phase();
+    let busy = updater::is_busy();
+    let configured = updater::is_configured();
+    let by = card_y + scale_px(68, dpi);
+    let bh = scale_px(24, dpi);
+    let gap = scale_px(8, dpi);
+    let mut bx = x + scale_px(16, dpi);
+    let mut out = Vec::new();
+
+    let check_w = scale_px(110, dpi);
+    out.push(UpdateButton {
+        id: 320,
+        x: bx,
+        y: by,
+        w: check_w,
+        h: bh,
+        label: tr("🔄 檢查更新", "🔄 Check now").to_string(),
+        disabled: busy || !configured,
+    });
+    bx += check_w + gap;
+
+    if let updater::Phase::Available(m) = &phase {
+        let inst_w = scale_px(170, dpi);
+        out.push(UpdateButton {
+            id: 321,
+            x: bx,
+            y: by,
+            w: inst_w,
+            h: bh,
+            label: format!("{} v{}", tr("⬇ 下載並安裝", "⬇ Install"), m.version),
+            disabled: busy,
+        });
+        bx += inst_w + gap;
     }
 
-    let _ = SelectClipRgn(hdc, None);
-    let _ = DeleteObject(rgn);
+    let notes_w = scale_px(110, dpi);
+    out.push(UpdateButton {
+        id: 322,
+        x: bx,
+        y: by,
+        w: notes_w,
+        h: bh,
+        label: tr("📄 版本資訊", "📄 Releases").to_string(),
+        disabled: false,
+    });
+
+    let auto_w = scale_px(170, dpi);
+    let auto_label = if state.settings.auto_check_updates {
+        tr("自動檢查更新：開", "Auto check: On")
+    } else {
+        tr("自動檢查更新：關", "Auto check: Off")
+    };
+    out.push(UpdateButton {
+        id: 323,
+        x: x + w - scale_px(16, dpi) - auto_w,
+        y: by,
+        w: auto_w,
+        h: bh,
+        label: auto_label.to_string(),
+        disabled: !configured,
+    });
+    out
+}
+
+fn update_status_text(state: &AppState) -> (String, bool) {
+    let cur = APP_VERSION;
+    match updater::phase() {
+        _ if !updater::is_configured() => (
+            tr(
+                "此版本未設定更新簽章金鑰，無法自動更新（請至 GitHub 發行頁面下載）",
+                "This build has no update signing key; download new versions from GitHub Releases",
+            )
+            .to_string(),
+            false,
+        ),
+        updater::Phase::Idle => {
+            let last = state.settings.last_update_check as u64;
+            let mut text = format!("{} {cur}", tr("目前版本", "Current version"));
+            if last != 0 {
+                let (y, m, d) = update_core::unix_to_ymd(last);
+                text.push_str(&format!(" · {} {y:04}-{m:02}-{d:02}", tr("上次檢查", "last checked")));
+            }
+            if updater::requires_approval() {
+                text.push_str(tr(" · 更新需維護者 YubiKey 核准", " · updates require maintainer YubiKey approval"));
+            }
+            (text, false)
+        }
+        updater::Phase::Checking => (tr("正在檢查更新…", "Checking for updates…").to_string(), false),
+        updater::Phase::UpToDate => (format!("{}（{cur}）", tr("已是最新版本", "You're up to date")), false),
+        updater::Phase::Available(m) => (
+            format!(
+                "{} v{}{}（{} {cur}）",
+                tr("有新版本", "New version"),
+                m.version,
+                tr(" 可供安裝", " is available"),
+                tr("目前", "current")
+            ),
+            false,
+        ),
+        updater::Phase::Downloading { done, total, version } => {
+            let mb = |b: u64| b as f64 / (1024.0 * 1024.0);
+            let text = if total > 0 {
+                format!(
+                    "{} v{version} … {}%（{:.1} / {:.1} MiB）",
+                    tr("正在下載", "Downloading"),
+                    done * 100 / total,
+                    mb(done),
+                    mb(total)
+                )
+            } else {
+                format!("{} v{version} … {:.1} MiB", tr("正在下載", "Downloading"), mb(done))
+            };
+            (text, false)
+        }
+        updater::Phase::Launching => (
+            tr("簽章驗證通過，正在啟動安裝程式…", "Signature verified; starting the installer…").to_string(),
+            false,
+        ),
+        updater::Phase::Error(e) => (format!("{}{e}", tr("更新失敗：", "Update failed: ")), true),
+    }
+}
+
+unsafe fn render_update_card(hdc: HDC, state: &AppState, x: i32, y: i32, w: i32) {
+    let th = theme();
+    let dpi = state.dpi;
+    draw_card_container(hdc, state, x, y, w, about_update_card_h(dpi));
+
+    SelectObject(hdc, state.font_bold);
+    SetTextColor(hdc, windows::Win32::Foundation::COLORREF(th.text_bright));
+    let title = to_wide(tr("軟體更新", "Software update"));
+    let _ = TextOutW(hdc, x + scale_px(16, dpi), y + scale_px(12, dpi), &title);
+
+    let (status, is_err) = update_status_text(state);
+    SelectObject(hdc, state.font_regular);
+    SetTextColor(
+        hdc,
+        windows::Win32::Foundation::COLORREF(if is_err { th.status_warn } else { th.text_secondary }),
+    );
+    let mut rc = RECT {
+        left: x + scale_px(16, dpi),
+        top: y + scale_px(36, dpi),
+        right: x + w - scale_px(16, dpi),
+        bottom: y + scale_px(60, dpi),
+    };
+    let mut sw = to_wide(&status);
+    let _ = DrawTextW(hdc, &mut sw, &mut rc, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+
+    for b in about_update_buttons(state, x, w, y) {
+        draw_subtle_button(hdc, state, b.id, b.x, b.y, b.w, b.h, &b.label, b.disabled);
+    }
+}
+
+unsafe fn handle_update_button(hwnd: HWND, state: &mut AppState, id: u32) {
+    match id {
+        320 => updater::start_check(hwnd.0),
+        321 => {
+            if let updater::Phase::Available(m) = updater::phase() {
+                use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, IDOK, MB_ICONQUESTION, MB_OKCANCEL};
+                let body = to_wide(&format!(
+                    "{} v{}{}",
+                    tr("將下載並安裝 CBX Shell ", "CBX Shell "),
+                    m.version,
+                    tr(
+                        "。\n\n安裝檔會先驗證數位簽章；安裝期間管理工具會關閉，完成後自動重新開啟，設定與檔案關聯都會保留。",
+                        " will be downloaded and installed.\n\nThe installer's signature is verified first. The manager closes during the update and reopens afterwards; settings and file associations are kept."
+                    )
+                ));
+                let title = to_wide(tr("安裝更新", "Install update"));
+                let answer = MessageBoxW(hwnd, PCWSTR(body.as_ptr()), PCWSTR(title.as_ptr()), MB_OKCANCEL | MB_ICONQUESTION);
+                if answer == IDOK {
+                    updater::start_install(hwnd.0, m);
+                }
+            }
+        }
+        322 => {
+            let version = match updater::phase() {
+                updater::Phase::Available(m) => Some(m.version),
+                _ => None,
+            };
+            updater::open_release_page(version.as_deref());
+        }
+        323 => {
+            state.settings.auto_check_updates = !state.settings.auto_check_updates;
+            let _ = state.settings.save();
+        }
+        _ => {}
+    }
 }
 
 unsafe fn render_about_page(hdc: HDC, state: &AppState, x: i32, w: i32) {
@@ -7733,7 +9238,7 @@ unsafe fn render_about_page(hdc: HDC, state: &AppState, x: i32, w: i32) {
     let th = theme();
     SelectObject(hdc, state.font_bold);
     SetTextColor(hdc, windows::Win32::Foundation::COLORREF(th.text_bright));
-    let name_w = to_wide("CBX Shell 2.0 (cbxshell-rs)");
+    let name_w = to_wide(&format!("CBX Shell {APP_VERSION} (cbxshell-rs)"));
     let _ = TextOutW(hdc, x + scale_px(16, state.dpi), card1_y + scale_px(14, state.dpi), &name_w);
 
     SelectObject(hdc, state.font_small);
@@ -7752,8 +9257,12 @@ unsafe fn render_about_page(hdc: HDC, state: &AppState, x: i32, w: i32) {
     let mut sw = to_wide(summary);
     let _ = DrawTextW(hdc, &mut sw, &mut rect_summary, DT_LEFT | DT_WORDBREAK | DT_NOPREFIX);
 
+    // Card: Software update (version check / signed auto-update)
+    let upd_y = card1_y + card1_h + scale_px(14, state.dpi);
+    render_update_card(hdc, state, x, upd_y, w);
+
     // Card 2: Software Bill of Materials (SBOM) Table
-    let card2_y = card1_y + card1_h + scale_px(14, state.dpi);
+    let card2_y = upd_y + about_update_card_h(state.dpi) + scale_px(14, state.dpi);
     let card2_h = scale_px(404, state.dpi);
     draw_card_container(hdc, state, x, card2_y, w, card2_h);
 
@@ -8291,6 +9800,20 @@ unsafe fn render_border_preview_widget(
 // Fluent Control Drawing Helpers: Card, Toggle, Slider, Buttons with RoundRect
 // -----------------------------------------------------------------------------
 
+/// Win11 expander seam: instead of an inset hairline, the expanded card is cut across its full
+/// width (borders included) by a strip of the page background, so header and content read as
+/// two stacked sub-cards.
+unsafe fn draw_expander_seam(hdc: HDC, state: &AppState, x: i32, y: i32, w: i32) {
+    let seam_h = scale_px(2, state.dpi).max(2);
+    let top = y - seam_h / 2;
+    let brush = CreateSolidBrush(windows::Win32::Foundation::COLORREF(theme().win_bg));
+    // One extra pixel each side also cuts the outline of a hover-enlarged card.
+    let g = scale_px(1, state.dpi).max(1);
+    let rc = RECT { left: x - g, top, right: x + w + g, bottom: top + seam_h };
+    let _ = FillRect(hdc, &rc, brush);
+    let _ = DeleteObject(brush);
+}
+
 unsafe fn draw_collapsible_header_hover(
     hdc: HDC,
     state: &AppState,
@@ -8365,6 +9888,115 @@ unsafe fn draw_win11_drop_shadow_layers(hdc: HDC, x: i32, y: i32, w: i32, h: i32
     }
 }
 
+/// Height of the network-share rows in the Everything card body (taller while the warning shows).
+fn net_share_rows_height(state: &AppState) -> i32 {
+    scale_px(if state.settings.allow_network_shares { 140 } else { 116 }, state.dpi)
+}
+
+/// Toggle positions of the network-share rows: (switch x, row-1 switch y, row-2 switch y).
+/// Same right inset as the toggles of other expander bodies.
+fn net_share_toggle_pos(state: &AppState, row_x: i32, rows_y: i32, row_w: i32) -> (i32, i32, i32) {
+    let sw_x = row_x + row_w - scale_px(40, state.dpi) - scale_px(52, state.dpi);
+    (sw_x, rows_y + scale_px(19, state.dpi), rows_y + scale_px(19 + 58, state.dpi))
+}
+
+/// Network-share settings as expander-body rows, separated from the note above and from each
+/// other by card seams.
+unsafe fn render_net_share_rows(hdc: HDC, state: &AppState, card_x: i32, card_w: i32, row_x: i32, rows_y: i32, row_w: i32) {
+    let th = theme();
+    let allow = state.settings.allow_network_shares;
+    let (sw_x, sw1_y, sw2_y) = net_share_toggle_pos(state, row_x, rows_y, row_w);
+    let text_x = row_x + scale_px(16, state.dpi);
+    let text_r = sw_x - scale_px(16, state.dpi);
+    let line = |top: i32, bottom: i32| RECT { left: text_x, top: rows_y + scale_px(top, state.dpi), right: text_r, bottom: rows_y + scale_px(bottom, state.dpi) };
+    let flags = DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS;
+
+    draw_expander_seam(hdc, state, card_x, rows_y, card_w);
+
+    // Row 1: allow network shares
+    SelectObject(hdc, state.font_regular);
+    SetTextColor(hdc, windows::Win32::Foundation::COLORREF(th.text_secondary));
+    let mut t1 = to_wide(tr("允許讀取網路共用資料夾", "Allow reading network shares"));
+    let mut r1 = line(10, 30);
+    let _ = DrawTextW(hdc, &mut t1, &mut r1, flags);
+    SelectObject(hdc, state.font_small);
+    SetTextColor(hdc, windows::Win32::Foundation::COLORREF(th.text_dim));
+    let mut d1 = to_wide(tr(
+        "UNC 路徑與對應的網路磁碟機可直接開檔，Everything 對網路共用的索引結果也會被採用；關閉時只透過檔案總管提供的串流讀取。",
+        "Opens files on UNC paths and mapped network drives directly and accepts Everything hits there; when off, only the stream Explorer provides is read.",
+    ));
+    let mut rd1 = line(30, 50);
+    let _ = DrawTextW(hdc, &mut d1, &mut rd1, flags);
+    draw_toggle_switch(hdc, state, 15, sw_x, sw1_y, allow, false);
+
+    draw_expander_seam(hdc, state, card_x, rows_y + scale_px(58, state.dpi), card_w);
+
+    // Row 2: LAN only (only adjustable while row 1 is on)
+    SelectObject(hdc, state.font_regular);
+    SetTextColor(hdc, windows::Win32::Foundation::COLORREF(if allow { th.text_secondary } else { th.text_disabled }));
+    let mut t2 = to_wide(tr("只能讀取區域網路", "Local network only"));
+    let mut r2 = line(68, 88);
+    let _ = DrawTextW(hdc, &mut t2, &mut r2, flags);
+    SelectObject(hdc, state.font_small);
+    SetTextColor(hdc, windows::Win32::Foundation::COLORREF(if allow { th.text_dim } else { th.text_disabled }));
+    let mut d2 = to_wide(tr(
+        "只接受私有 IP、單一名稱（如 NAS）與 .local／.lan 等區域網路名稱的伺服器；不做 DNS 查詢。",
+        "Only servers with private IPs, single-label names (e.g. NAS) or .local / .lan style names; no DNS lookups.",
+    ));
+    let mut rd2 = line(88, 108);
+    let _ = DrawTextW(hdc, &mut d2, &mut rd2, flags);
+    draw_toggle_switch(hdc, state, 16, sw_x, sw2_y, state.settings.network_lan_only, !allow);
+
+    if allow {
+        SelectObject(hdc, state.font_small);
+        SetTextColor(hdc, windows::Win32::Foundation::COLORREF(th.status_warn));
+        let mut wt = to_wide(tr(
+            "⚠ 已允許網路讀取：縮圖程序會以您的 Windows 認證連線到這些伺服器，請只對信任的共用資料夾使用。",
+            "⚠ Network reads on: the thumbnail host connects to these servers with your Windows credentials. Use only with trusted shares.",
+        ));
+        let mut wr = RECT { left: text_x, top: rows_y + scale_px(110, state.dpi), right: row_x + row_w - scale_px(16, state.dpi), bottom: rows_y + scale_px(130, state.dpi) };
+        let _ = DrawTextW(hdc, &mut wt, &mut wr, flags);
+    }
+}
+
+/// Click handling for the network-share rows; `true` when the click was consumed.
+unsafe fn handle_net_share_click(hwnd: HWND, state: &mut AppState, row_x: i32, rows_y: i32, row_w: i32, x: i32, y: i32) -> bool {
+    let (sw_x, sw1_y, sw2_y) = net_share_toggle_pos(state, row_x, rows_y, row_w);
+    let sw_w = scale_px(40, state.dpi);
+    let row_h = scale_px(20, state.dpi);
+    let pad = scale_px(4, state.dpi);
+    let hit = |sy: i32| x >= sw_x - pad && x <= sw_x + sw_w + pad && y >= sy - pad && y <= sy + row_h + pad;
+    if hit(sw1_y) {
+        commit_active_edit(state);
+        let enable = !state.settings.allow_network_shares;
+        if enable {
+            let title = to_wide(tr("允許讀取網路共用資料夾", "Allow reading network shares"));
+            let body = to_wide(tr(
+                "開啟後，產生縮圖時會直接開啟網路共用資料夾（UNC 路徑或對應的網路磁碟機）中的檔案，並採用 Everything 對網路位置的索引結果。\n\n• 縮圖程序會以您的 Windows 認證連線到檔案所在的伺服器；若伺服器不可信，可能被用來蒐集您的認證資訊。\n• 網路緩慢或伺服器離線時，縮圖產生可能變慢。\n\n建議同時保持「只能讀取區域網路」開啟。確定要開啟嗎？",
+                "When enabled, thumbnails open files on network shares (UNC paths or mapped network drives) directly and accept Everything index hits on network locations.\n\n• The thumbnail host connects to the file's server with your Windows credentials; an untrusted server could use this to harvest them.\n• Slow networks or offline servers can slow down thumbnail generation.\n\nKeeping \"Local network only\" on is recommended. Enable network reads?",
+            ));
+            use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, IDYES, MB_DEFBUTTON2, MB_ICONWARNING, MB_YESNO};
+            let answer = MessageBoxW(hwnd, PCWSTR(body.as_ptr()), PCWSTR(title.as_ptr()), MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2);
+            if answer != IDYES {
+                let _ = InvalidateRect(hwnd, None, false);
+                return true;
+            }
+        }
+        state.settings.allow_network_shares = enable;
+        let _ = state.settings.save();
+        trigger_toggle_animation(hwnd, state, 15, enable);
+        return true;
+    }
+    if hit(sw2_y) && state.settings.allow_network_shares {
+        commit_active_edit(state);
+        state.settings.network_lan_only = !state.settings.network_lan_only;
+        let _ = state.settings.save();
+        trigger_toggle_animation(hwnd, state, 16, state.settings.network_lan_only);
+        return true;
+    }
+    false
+}
+
 unsafe fn draw_card_container(hdc: HDC, state: &AppState, x: i32, y: i32, w: i32, h: i32) {
     let th = theme();
     let r = scale_px(12, state.dpi);
@@ -8377,6 +10009,14 @@ unsafe fn draw_card_container(hdc: HDC, state: &AppState, x: i32, y: i32, w: i32
     SelectObject(hdc, old_p);
     let _ = DeleteObject(bg);
     let _ = DeleteObject(pen);
+}
+
+/// Expander card: while its header is hovered the whole card grows 1 px on every side (on top of
+/// the header fill change), so the card itself reads as the interactive surface.
+#[allow(clippy::too_many_arguments)]
+unsafe fn draw_expander_card_container(hdc: HDC, state: &AppState, x: i32, y: i32, w: i32, h: i32, hovered: bool) {
+    let g = if hovered { scale_px(1, state.dpi).max(1) } else { 0 };
+    draw_card_container(hdc, state, x - g, y - g, w + g * 2, h + g * 2);
 }
 
 unsafe fn draw_sub_card(hdc: HDC, state: &AppState, x: i32, y: i32, w: i32, h: i32) {
@@ -8664,6 +10304,226 @@ unsafe fn draw_risk_checkbox_row(
     let _ = DrawTextW(hdc, &mut lw, &mut text_rect, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 }
 
+/// Win11 TextBox chrome: subtle fill and hairline border, a stronger bottom stroke at rest, a
+/// lighter fill on hover, and a darker fill with a 2 px accent bottom stroke while focused.
+#[allow(clippy::too_many_arguments)]
+unsafe fn draw_win11_textbox_frame(hdc: HDC, state: &AppState, x: i32, y: i32, w: i32, h: i32, focused: bool, hovered: bool, disabled: bool) {
+    let th = theme();
+    let base = th.card_bg;
+    let (white, black) = (0x00FFFFFFu32, 0x00000000u32);
+    let (fill, side, bottom) = if th.dark {
+        let fill = if disabled {
+            lerp_color(base, white, 0.03)
+        } else if focused {
+            lerp_color(base, black, 0.28)
+        } else if hovered {
+            lerp_color(base, white, 0.09)
+        } else {
+            lerp_color(base, white, 0.06)
+        };
+        (fill, lerp_color(base, white, 0.08), lerp_color(base, white, if disabled { 0.08 } else { 0.45 }))
+    } else {
+        let fill = if disabled {
+            lerp_color(base, black, 0.03)
+        } else if focused {
+            white
+        } else if hovered {
+            lerp_color(base, black, 0.035)
+        } else {
+            lerp_color(base, black, 0.015)
+        };
+        (fill, lerp_color(base, black, 0.07), lerp_color(base, black, if disabled { 0.07 } else { 0.45 }))
+    };
+    let r = scale_px(8, state.dpi);
+    let br = CreateSolidBrush(windows::Win32::Foundation::COLORREF(fill));
+    let pen = CreatePen(PS_SOLID, 1, windows::Win32::Foundation::COLORREF(side));
+    let ob = SelectObject(hdc, br);
+    let op = SelectObject(hdc, pen);
+    let _ = RoundRect(hdc, x, y, x + w, y + h, r, r);
+    SelectObject(hdc, ob);
+    SelectObject(hdc, op);
+    let _ = DeleteObject(br);
+    let _ = DeleteObject(pen);
+
+    // Bottom stroke, inset by the corner radius so it follows the rounded outline.
+    let (stroke_col, stroke_h) = if focused && !disabled { (accent_base_bgr(), scale_px(2, state.dpi).max(2)) } else { (bottom, 1) };
+    let inset = scale_px(3, state.dpi);
+    let sb = CreateSolidBrush(windows::Win32::Foundation::COLORREF(stroke_col));
+    let rc = RECT { left: x + inset, top: y + h - stroke_h, right: x + w - inset, bottom: y + h };
+    let _ = FillRect(hdc, &rc, sb);
+    let _ = DeleteObject(sb);
+}
+
+/// Width (physical px) reserved at the right of a text box for its clear button.
+fn textbox_clear_w(state: &AppState) -> i32 {
+    scale_px(24, state.dpi)
+}
+
+/// Clear ("X") button inside a focused, non-empty text box: subtle hover / pressed fill. Its
+/// rectangle is recorded so the click can be handled before the box's own focus logic.
+unsafe fn draw_textbox_clear_button(hdc: HDC, state: &AppState, box_x: i32, box_y: i32, box_w: i32, box_h: i32) {
+    let th = theme();
+    let pad = scale_px(3, state.dpi);
+    let bw = textbox_clear_w(state) - pad;
+    let rc = RECT { left: box_x + box_w - pad - bw, top: box_y + pad, right: box_x + box_w - pad, bottom: box_y + box_h - pad };
+    state.edit_clear_rect.set(Some(rc));
+    let hovered = state.mouse_pos.0 >= rc.left && state.mouse_pos.0 < rc.right && state.mouse_pos.1 >= rc.top && state.mouse_pos.1 < rc.bottom;
+    let base = if th.dark { lerp_color(th.card_bg, 0, 0.28) } else { 0x00FFFFFF };
+    let fill = if state.edit_clear_pressed {
+        Some(if th.dark { lerp_color(base, 0x00FFFFFF, 0.04) } else { lerp_color(base, 0, 0.03) })
+    } else if hovered {
+        Some(if th.dark { lerp_color(base, 0x00FFFFFF, 0.08) } else { lerp_color(base, 0, 0.06) })
+    } else {
+        None
+    };
+    if let Some(col) = fill {
+        let br = CreateSolidBrush(windows::Win32::Foundation::COLORREF(col));
+        let pen = CreatePen(PS_SOLID, 1, windows::Win32::Foundation::COLORREF(col));
+        let ob = SelectObject(hdc, br);
+        let op = SelectObject(hdc, pen);
+        let r = scale_px(6, state.dpi);
+        let _ = RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, r, r);
+        SelectObject(hdc, ob);
+        SelectObject(hdc, op);
+        let _ = DeleteObject(br);
+        let _ = DeleteObject(pen);
+    }
+    let old_f = SelectObject(hdc, state.font_chevron);
+    SetTextColor(hdc, windows::Win32::Foundation::COLORREF(if state.edit_clear_pressed { th.text_muted } else { th.text_secondary }));
+    let mut gw = to_wide("\u{E894}");
+    let mut grc = rc;
+    let _ = DrawTextW(hdc, &mut gw, &mut grc, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    SelectObject(hdc, old_f);
+}
+
+fn text_width(hdc: HDC, text: &str) -> i32 {
+    if text.is_empty() {
+        return 0;
+    }
+    let mut sz = windows::Win32::Foundation::SIZE::default();
+    let raw: Vec<u16> = text.encode_utf16().collect();
+    // SAFETY: valid DC and UTF-16 slice.
+    let _ = unsafe { windows::Win32::Graphics::Gdi::GetTextExtentPoint32W(hdc, &raw, &mut sz) };
+    sz.cx
+}
+
+/// Current value of a field as shown when it gains focus.
+fn edit_value_string(state: &AppState, target: EditTarget) -> String {
+    let st = &state.settings;
+    match target {
+        EditTarget::SeekFixedSec => st.seek_fixed_sec.to_string(),
+        EditTarget::SeekThresholdMin => st.seek_threshold_min.to_string(),
+        EditTarget::StepProbeSec => st.step_probe_sec.to_string(),
+        EditTarget::MaxGopHops => st.max_gop_hops.to_string(),
+        EditTarget::ConsecutiveLimit => st.consecutive_unacceptable_limit.to_string(),
+        EditTarget::WatchdogTimeoutSec => st.watchdog_timeout_sec.to_string(),
+        EditTarget::CustomTextExtensions => st.custom_text_extensions.clone(),
+    }
+}
+
+/// Caret index in `text` closest to screen x inside the box `g`.
+unsafe fn edit_hit_index(hwnd: HWND, g: &EditBoxGeom, text: &str, x: i32) -> usize {
+    let hdc = windows::Win32::Graphics::Gdi::GetDC(hwnd);
+    let old = SelectObject(hdc, g.font);
+    let mut best = 0usize;
+    let mut best_d = i32::MAX;
+    for i in 0..=text.len() {
+        if !text.is_char_boundary(i) {
+            continue;
+        }
+        let d = (g.text_left + text_width(hdc, &text[..i]) - x).abs();
+        if d < best_d {
+            best_d = d;
+            best = i;
+        }
+    }
+    SelectObject(hdc, old);
+    let _ = windows::Win32::Graphics::Gdi::ReleaseDC(hwnd, hdc);
+    best
+}
+
+/// Text of a text box. Focused: the selected range gets an accent highlight with contrast text,
+/// otherwise a 1 px caret; nothing is highlighted just because the box has focus.
+#[allow(clippy::too_many_arguments)]
+unsafe fn draw_edit_text(hdc: HDC, state: &AppState, font: HFONT, text: &str, color: u32, left: i32, right: i32, box_y: i32, box_h: i32, focused: bool) {
+    let old = SelectObject(hdc, font);
+    let flags = DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX;
+    if !focused {
+        SetTextColor(hdc, windows::Win32::Foundation::COLORREF(color));
+        let mut w = to_wide(text);
+        let mut rc = RECT { left, top: box_y, right, bottom: box_y + box_h };
+        let _ = DrawTextW(hdc, &mut w, &mut rc, flags | DT_END_ELLIPSIS);
+        SelectObject(hdc, old);
+        return;
+    }
+    let (sel_s, sel_e) = state.edit_sel();
+    let (sel_s, sel_e) = (sel_s.min(text.len()), sel_e.min(text.len()));
+    let x_of = |i: usize| left + text_width(hdc, &text[..i]);
+    let draw_seg = |from: usize, to: usize, col: u32| {
+        if from >= to {
+            return;
+        }
+        SetTextColor(hdc, windows::Win32::Foundation::COLORREF(col));
+        let mut w = to_wide(&text[from..to]);
+        let mut rc = RECT { left: x_of(from), top: box_y, right, bottom: box_y + box_h };
+        let _ = DrawTextW(hdc, &mut w, &mut rc, flags);
+    };
+    if sel_s < sel_e {
+        let mut sz = windows::Win32::Foundation::SIZE::default();
+        let probe: Vec<u16> = "Ag".encode_utf16().collect();
+        let _ = windows::Win32::Graphics::Gdi::GetTextExtentPoint32W(hdc, &probe, &mut sz);
+        let sel_rc = RECT {
+            left: x_of(sel_s),
+            top: box_y + (box_h - sz.cy) / 2,
+            right: x_of(sel_e).min(right),
+            bottom: box_y + (box_h + sz.cy) / 2,
+        };
+        let br = CreateSolidBrush(windows::Win32::Foundation::COLORREF(accent_base_bgr()));
+        let _ = FillRect(hdc, &sel_rc, br);
+        let _ = DeleteObject(br);
+    }
+    draw_seg(0, sel_s, color);
+    draw_seg(sel_s, sel_e, accent_contrast_text_bgr());
+    draw_seg(sel_e, text.len(), color);
+    if sel_s == sel_e {
+        let caret = state.edit_fix(state.edit_caret).min(text.len());
+        draw_textbox_caret(hdc, state, &text[..caret], left, right, box_y, box_h);
+    }
+    SelectObject(hdc, old);
+}
+
+/// Text-box caret (1 px, `text_primary`) after `text` drawn from `left`.
+unsafe fn draw_textbox_caret(hdc: HDC, state: &AppState, text: &str, left: i32, right: i32, box_y: i32, box_h: i32) {
+    let mut sz = windows::Win32::Foundation::SIZE::default();
+    let raw: Vec<u16> = text.encode_utf16().collect();
+    let _ = windows::Win32::Graphics::Gdi::GetTextExtentPoint32W(hdc, &raw, &mut sz);
+    let caret_x = (left + sz.cx + 1).min(right - 1);
+    let pen = CreatePen(PS_SOLID, 1, windows::Win32::Foundation::COLORREF(theme().text_primary));
+    let op = SelectObject(hdc, pen);
+    let inset = (box_h / 4).max(scale_px(5, state.dpi).min(box_h / 3));
+    let _ = MoveToEx(hdc, caret_x, box_y + inset, None);
+    let _ = LineTo(hdc, caret_x, box_y + box_h - inset);
+    SelectObject(hdc, op);
+    let _ = DeleteObject(pen);
+}
+
+/// Clear button action: empty the field, or restore its default value when it has one.
+fn clear_active_edit_to_default(state: &mut AppState) {
+    let Some(target) = state.active_edit else { return };
+    let d = Settings::default();
+    state.edit_buffer = match target {
+        EditTarget::SeekFixedSec => d.seek_fixed_sec.to_string(),
+        EditTarget::SeekThresholdMin => d.seek_threshold_min.to_string(),
+        EditTarget::StepProbeSec => d.step_probe_sec.to_string(),
+        EditTarget::MaxGopHops => d.max_gop_hops.to_string(),
+        EditTarget::ConsecutiveLimit => d.consecutive_unacceptable_limit.to_string(),
+        EditTarget::WatchdogTimeoutSec => d.watchdog_timeout_sec.to_string(),
+        EditTarget::CustomTextExtensions => d.custom_text_extensions.clone(),
+    };
+    state.edit_caret_to_end();
+    state.has_unapplied_text_edits = true;
+}
+
 unsafe fn draw_row_number_input(
     hdc: HDC,
     state: &AppState,
@@ -8699,70 +10559,29 @@ unsafe fn draw_row_number_input(
     let (mx, my) = state.mouse_pos;
     let is_hovered = !is_disabled && mx >= box_x && mx <= box_x + box_w && my >= box_y && my <= box_y + box_h;
 
-    // Box background and border
-    let (bg_color, border_color) = if is_disabled {
-        (th.btn_disabled_bg, th.btn_disabled_border)
-    } else if is_focused {
-        (th.input_bg, accent_base_bgr())
-    } else if is_hovered {
-        (th.btn_hover_bg, th.btn_hover_border)
-    } else {
-        (th.input_bg, th.input_border)
-    };
+    // Win11 TextBox chrome (+ clear button once the focused box has content)
+    draw_win11_textbox_frame(hdc, state, box_x, box_y, box_w, box_h, is_focused, is_hovered, is_disabled);
+    let show_clear = is_focused && !is_disabled && !state.edit_buffer.is_empty();
+    let text_right = box_x + box_w - if show_clear { textbox_clear_w(state) + scale_px(2, state.dpi) } else { scale_px(6, state.dpi) };
 
-    let r = scale_px(4, state.dpi);
-    let bg = CreateSolidBrush(windows::Win32::Foundation::COLORREF(bg_color));
-    let pen = CreatePen(PS_SOLID, if is_focused { 2 } else { 1 }, windows::Win32::Foundation::COLORREF(border_color));
-    let old_b = SelectObject(hdc, bg);
-    let old_p = SelectObject(hdc, pen);
-    let _ = RoundRect(hdc, box_x, box_y, box_x + box_w, box_y + box_h, r, r);
-    SelectObject(hdc, old_b);
-    SelectObject(hdc, old_p);
-    let _ = DeleteObject(bg);
-    let _ = DeleteObject(pen);
 
-    // Draw selection highlight background block if select-all is active
-    if is_focused && state.edit_select_all && !state.edit_buffer.is_empty() {
-        let sel_bg = CreateSolidBrush(windows::Win32::Foundation::COLORREF(accent_subtle_bg_bgr()));
-        let sel_rect = RECT {
-            left: box_x + scale_px(4, state.dpi),
-            top: box_y + scale_px(3, state.dpi),
-            right: box_x + box_w - scale_px(4, state.dpi),
-            bottom: box_y + box_h - scale_px(3, state.dpi),
-        };
-        FillRect(hdc, &sel_rect, sel_bg);
-        let _ = DeleteObject(sel_bg);
+    // Text: value, or the edit buffer with caret / mouse selection while focused
+    let text_val = if is_focused { state.edit_buffer.clone() } else { val.to_string() };
+    let text_left = box_x + scale_px(8, state.dpi);
+    if !is_disabled {
+        state.edit_boxes.borrow_mut().push(EditBoxGeom {
+            target,
+            rect: RECT { left: box_x, top: box_y, right: box_x + box_w, bottom: box_y + box_h },
+            text_left,
+            text_right,
+            font: state.font_bold,
+        });
     }
-
-    // Text inside box - completely clean without annoying underscore
-    let text_val = if is_focused {
-        if state.edit_buffer.is_empty() {
-            "0".to_string()
-        } else {
-            state.edit_buffer.clone()
-        }
-    } else {
-        val.to_string()
-    };
-    SelectObject(hdc, state.font_bold);
-    SetTextColor(
-        hdc,
-        if is_disabled {
-            windows::Win32::Foundation::COLORREF(th.text_disabled)
-        } else if is_focused && state.edit_buffer.is_empty() {
-            windows::Win32::Foundation::COLORREF(th.text_muted)
-        } else {
-            windows::Win32::Foundation::COLORREF(th.text_bright)
-        },
-    );
-    let mut tw = to_wide(&text_val);
-    let mut rect = RECT {
-        left: box_x + scale_px(8, state.dpi),
-        top: box_y,
-        right: box_x + box_w - scale_px(6, state.dpi),
-        bottom: box_y + box_h,
-    };
-    let _ = DrawTextW(hdc, &mut tw, &mut rect, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    let text_col = if is_disabled { th.text_disabled } else { th.text_bright };
+    draw_edit_text(hdc, state, state.font_bold, &text_val, text_col, text_left, text_right, box_y, box_h, is_focused);
+    if show_clear {
+        draw_textbox_clear_button(hdc, state, box_x, box_y, box_w, box_h);
+    }
 
     // Unit label outside box
     SelectObject(hdc, state.font_small);
@@ -9001,9 +10820,13 @@ unsafe fn draw_rounded_button(
     let _ = DrawTextW(hdc, &mut lw, &mut rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 }
 
+/// Language selector at the bottom of the rail, styled like a navigation item: transparent until
+/// hovered / pressed / open, globe centred in the shared icon column, then the language name and
+/// an up-chevron (hidden when the rail is collapsed).
 unsafe fn draw_language_button(
     hdc: HDC,
     dib: &DibSurface,
+    htheme: HTHEME,
     state: &AppState,
     btn_id: u32,
     x: i32,
@@ -9011,153 +10834,77 @@ unsafe fn draw_language_button(
     w: i32,
     h: i32,
 ) {
-    let r = scale_px(6, state.dpi);
+    let th = theme();
     let is_pressed = state.pressed_btn == Some(btn_id) || state.lang_btn_pressed;
     let is_hovered = state.mouse_pos.0 >= x && state.mouse_pos.0 <= x + w && state.mouse_pos.1 >= y && state.mouse_pos.1 <= y + h;
 
-    let th = theme();
-    let (bg_color, border_color, text_color) = if state.is_lang_menu_open {
-        (th.btn_hover_bg, th.btn_hover_border, th.text_bright)
-    } else if is_pressed {
-        (th.sub_card_bg, th.btn_border, th.text_secondary)
-    } else if is_hovered {
-        (th.btn_hover_bg, th.btn_hover_border, th.text_bright)
-    } else {
-        (th.btn_bg, th.btn_border, th.text_secondary)
-    };
-
-    dib.fill_rounded_translucent(x, y, w, h, r, bg_color, 255, border_color, 255);
-
-    // Current language label
-    let cur_lang = current_lang();
-    let cur_name = AVAILABLE_LOCALES.iter().find(|l| l.lang == cur_lang).map(|l| l.display_name).unwrap_or("繁體中文");
-    let label = format!("🌐  {}", cur_name);
-
-    SelectObject(hdc, state.font_regular);
-    SetTextColor(hdc, windows::Win32::Foundation::COLORREF(text_color));
-
-    let mut lw = to_wide(&label);
-    let text_x = x + scale_px(10, state.dpi);
-    let mut text_rect = RECT {
-        left: text_x,
-        top: y,
-        right: x + w - scale_px(24, state.dpi),
-        bottom: y + h,
-    };
-    let _ = DrawTextW(hdc, &mut lw, &mut text_rect, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-
-    // Right side Up Arrow: Vector-drawn Chevron
-    // User requested: "按鈕右邊要有個向上箭頭 代表可展開，滑鼠點擊時箭頭要輕微向上移動"
-    let arrow_offset_y = if state.is_lang_menu_open || is_pressed {
-        -scale_px(2, state.dpi)
+    let pill_a: u8 = if is_pressed {
+        if th.dark { 10 } else { 7 }
+    } else if is_hovered || state.is_lang_menu_open {
+        if th.dark { 16 } else { 11 }
     } else {
         0
     };
-    let arrow_cx = x + w - scale_px(16, state.dpi);
-    let arrow_cy = y + h / 2 + arrow_offset_y;
-    let arrow_col = if state.is_lang_menu_open { accent_light_bgr() } else { th.text_muted };
-    draw_chevron(hdc, state, arrow_cx, arrow_cy, true, arrow_col);
-    dib.stamp_opaque_nonzero_rect(x + 2, y + 2, x + w - 2, y + h - 2);
-}
+    if pill_a > 0 {
+        let pill_bgr = if th.dark { 0x00FFFFFF } else { 0x00000000 };
+        dib.fill_rounded_translucent(x, y, w, h, scale_px(8, state.dpi), pill_bgr, pill_a, pill_bgr, 0);
+    }
+    let text_color = if is_pressed {
+        if th.dark { 0x00A6A6A6 } else { 0x00666666 }
+    } else if th.dark {
+        0x00FFFFFF
+    } else {
+        0x001A1A1A
+    };
 
-unsafe fn draw_language_flyout_menu(hdc: HDC, state: &AppState, sidebar_w: i32, win_h: i32) {
-    let lang_y = win_h - scale_px(50, state.dpi);
-    let lang_x = scale_px(16, state.dpi);
-    let lang_w = sidebar_w - scale_px(32, state.dpi);
-    let lang_h = scale_px(32, state.dpi);
-    let btn_bottom = lang_y + lang_h;
-
-    let item_h = scale_px(36, state.dpi);
-    let padding = scale_px(4, state.dpi);
-    let menu_w = lang_w;
-    let full_menu_h = (AVAILABLE_LOCALES.len() as i32 * item_h) + padding * 2;
-
-    // Upward extension animation: starts at button height, grows upwards while covering the button
-    let anim_val = if state.lang_menu_anim_start.is_some() { state.lang_menu_anim } else { 1.0 };
-    let current_h = lang_h + (((full_menu_h - lang_h) as f32) * anim_val) as i32;
-    let menu_top = btn_bottom - current_h;
-    let corner_r = scale_px(8, state.dpi);
-
-    let th = theme();
-    // Dropdown card background & border (Win11 fluent flyout covering original button)
-    let bg = CreateSolidBrush(windows::Win32::Foundation::COLORREF(th.card_bg));
-    let pen = CreatePen(PS_SOLID, 1, windows::Win32::Foundation::COLORREF(th.btn_border));
-    let old_b = SelectObject(hdc, bg);
-    let old_p = SelectObject(hdc, pen);
-    let _ = windows::Win32::Graphics::Gdi::RoundRect(hdc, lang_x, menu_top, lang_x + menu_w, btn_bottom, corner_r, corner_r);
-    SelectObject(hdc, old_b);
-    SelectObject(hdc, old_p);
-    let _ = DeleteObject(bg);
-    let _ = DeleteObject(pen);
-
-    // Clip rendering to menu bounds during upward extension animation
-    let rgn = CreateRectRgn(lang_x, menu_top, lang_x + menu_w, btn_bottom);
-    let _ = SelectClipRgn(hdc, rgn);
-
-    let cur_lang = current_lang();
-    let item_r = scale_px(5, state.dpi);
-
-    for (idx, loc) in AVAILABLE_LOCALES.iter().enumerate() {
-        let ix = lang_x + padding;
-        let iy = menu_top + padding + (idx as i32 * item_h);
-        let iw = menu_w - padding * 2;
-        let is_selected = loc.lang == cur_lang;
-        let is_hover = state.hover_lang_item == Some(idx);
-
-        if is_hover {
-            let hov_b = CreateSolidBrush(windows::Win32::Foundation::COLORREF(th.btn_hover_bg));
-            let hov_p = CreatePen(PS_SOLID, 1, windows::Win32::Foundation::COLORREF(th.btn_hover_bg));
-            let ob = SelectObject(hdc, hov_b);
-            let op = SelectObject(hdc, hov_p);
-            let _ = windows::Win32::Graphics::Gdi::RoundRect(hdc, ix, iy, ix + iw, iy + item_h, item_r, item_r);
-            SelectObject(hdc, ob);
-            SelectObject(hdc, op);
-            let _ = DeleteObject(hov_b);
-            let _ = DeleteObject(hov_p);
-        }
-
-        // Active/Selected Item: Win11 Accent Pill Indicator on the left
-        if is_selected {
-            let pill_x = ix + scale_px(4, state.dpi);
-            let pill_w = scale_px(3, state.dpi);
-            let pill_h = scale_px(16, state.dpi);
-            let pill_y = iy + (item_h - pill_h) / 2;
-            let accent_bgr = accent_base_bgr();
-            let pill_b = CreateSolidBrush(windows::Win32::Foundation::COLORREF(accent_bgr));
-            let pill_p = CreatePen(PS_SOLID, 1, windows::Win32::Foundation::COLORREF(accent_bgr));
-            let ob = SelectObject(hdc, pill_b);
-            let op = SelectObject(hdc, pill_p);
-            let _ = windows::Win32::Graphics::Gdi::RoundRect(hdc, pill_x, pill_y, pill_x + pill_w, pill_y + pill_h, 3, 3);
-            SelectObject(hdc, ob);
-            SelectObject(hdc, op);
-            let _ = DeleteObject(pill_b);
-            let _ = DeleteObject(pill_p);
-        }
-
-        // Display Name Text
-        SelectObject(hdc, state.font_regular);
-        let text_color = if is_selected {
-            th.text_bright
-        } else if is_hover {
-            th.text_primary
-        } else {
-            th.text_secondary
-        };
-        SetTextColor(hdc, windows::Win32::Foundation::COLORREF(text_color));
-
-        let mut name_w = to_wide(loc.display_name);
-        let mut item_rect = RECT {
-            left: ix + scale_px(16, state.dpi),
-            top: iy,
-            right: ix + iw - scale_px(8, state.dpi),
-            bottom: iy + item_h,
-        };
-        let _ = DrawTextW(hdc, &mut name_w, &mut item_rect, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    SelectObject(hdc, state.font_regular);
+    let icon_col = scale_px(RAIL_ICON_COL_W, state.dpi);
+    draw_composited_text(
+        hdc,
+        htheme,
+        "🌐",
+        RECT { left: x, top: y, right: x + icon_col, bottom: y + h },
+        text_color,
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+    );
+    if w < scale_px(90, state.dpi) {
+        return;
     }
 
-    let _ = SelectClipRgn(hdc, HRGN::default());
-    let _ = DeleteObject(rgn);
+    let cur_lang = current_lang();
+    let cur_name = AVAILABLE_LOCALES.iter().find(|l| l.lang == cur_lang).map(|l| l.display_name).unwrap_or("繁體中文");
+    draw_composited_text(
+        hdc,
+        htheme,
+        cur_name,
+        RECT {
+            left: x + icon_col + scale_px(4, state.dpi),
+            top: y,
+            right: x + w - scale_px(28, state.dpi),
+            bottom: y + h,
+        },
+        text_color,
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
+    );
+
+    // Up-chevron: signals the flyout opens upwards; lifts 2 px while pressed or open.
+    let arrow_offset_y = if state.is_lang_menu_open || is_pressed { -scale_px(2, state.dpi) } else { 0 };
+    let arrow_cx = x + w - scale_px(16, state.dpi);
+    let arrow_cy = y + h / 2 + arrow_offset_y;
+    let sz = scale_px(16, state.dpi);
+    let arrow_col = if state.is_lang_menu_open { accent_light_bgr() } else { th.text_muted };
+    let old_f = SelectObject(hdc, state.font_chevron);
+    draw_composited_text(
+        hdc,
+        htheme,
+        "\u{E70D}",
+        RECT { left: arrow_cx - sz / 2, top: arrow_cy - sz / 2, right: arrow_cx + sz / 2, bottom: arrow_cy + sz / 2 },
+        arrow_col,
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+    );
+    SelectObject(hdc, old_f);
 }
+
 
 unsafe fn draw_selectable_button(
     hdc: HDC,

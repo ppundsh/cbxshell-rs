@@ -155,9 +155,16 @@ fn main() {
         .windows(2)
         .find(|w| w[0].eq_ignore_ascii_case("--dir"))
         .map(|w| PathBuf::from(&w[1]));
+    let is_update = args.iter().any(|a| a.eq_ignore_ascii_case("--update"));
+    let wait_pid = args
+        .windows(2)
+        .find(|w| w[0].eq_ignore_ascii_case("--wait-pid"))
+        .and_then(|w| w[1].parse::<u32>().ok());
 
     let code = if is_uninstall {
         run_uninstaller(custom_dir, is_quiet)
+    } else if is_update {
+        run_update(custom_dir, wait_pid)
     } else if is_quiet {
         let target_dir = custom_dir.unwrap_or_else(default_install_dir);
         let opts = InstallOptions::default_with_dir(target_dir);
@@ -202,6 +209,9 @@ struct InstallOptions {
     create_shortcut: bool,
     clear_cache: bool,
     launch_manager: bool,
+    /// In-place update (`--update`): replace program files only; keep the user's settings, file
+    /// associations and shortcuts exactly as they are.
+    preserve_settings: bool,
 }
 
 impl InstallOptions {
@@ -221,8 +231,95 @@ impl InstallOptions {
             hdr_tonemap: true,
             enable_infotip: true,
             create_shortcut: true,
-            clear_cache: true,
+            // Existing thumbnails stay unless the user opts in (rebuilding them is slow).
+            clear_cache: false,
             launch_manager: false,
+            preserve_settings: false,
+        }
+    }
+
+    /// Options for an update started by the manager's updater.
+    fn update_with_dir(install_dir: PathBuf) -> Self {
+        Self {
+            install_ffmpeg: false,
+            create_shortcut: false,
+            clear_cache: false,
+            launch_manager: true,
+            preserve_settings: true,
+            ..Self::default_with_dir(install_dir)
+        }
+    }
+}
+
+#[link(name = "kernel32")]
+extern "system" {
+    #[link_name = "OpenProcess"]
+    fn k32_open_process(access: u32, inherit: i32, pid: u32) -> *mut std::ffi::c_void;
+    #[link_name = "WaitForSingleObject"]
+    fn k32_wait_for_single_object(handle: *mut std::ffi::c_void, ms: u32) -> u32;
+    #[link_name = "CloseHandle"]
+    fn k32_close_handle(handle: *mut std::ffi::c_void) -> i32;
+}
+
+/// Waits (bounded) for the process that launched the update — the manager — to exit so its
+/// executable is no longer in use.
+fn wait_for_process_exit(pid: u32, timeout_ms: u32) {
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+    // SAFETY: plain kernel32 calls; the handle is closed before returning.
+    unsafe {
+        let h = k32_open_process(SYNCHRONIZE, 0, pid);
+        if !h.is_null() {
+            let _ = k32_wait_for_single_object(h, timeout_ms);
+            let _ = k32_close_handle(h);
+        }
+    }
+}
+
+/// Removes `*.old` files left behind when a previous update had to rename locked files
+/// (e.g. `cbxshell.dll` still loaded by Explorer). Files that are still locked stay.
+fn cleanup_stale_old_files(dir: &Path) {
+    if let Ok(rd) = fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.extension().map(|x| x.eq_ignore_ascii_case("old")).unwrap_or(false) {
+                let _ = fs::remove_file(&p);
+            }
+        }
+    }
+}
+
+/// `--update`: in-place upgrade of an existing installation, started by the manager after it
+/// verified this installer's signature.
+fn run_update(custom_dir: Option<PathBuf>, wait_pid: Option<u32>) -> i32 {
+    if let Some(pid) = wait_pid {
+        wait_for_process_exit(pid, 15_000);
+    }
+    let dir = custom_dir.unwrap_or_else(default_install_dir);
+    let looks_installed = dir.join("cbx-manager.exe").is_file() || dir.join("cbxshell.dll").is_file();
+    let result = if looks_installed {
+        cleanup_stale_old_files(&dir);
+        perform_install(&InstallOptions::update_with_dir(dir.clone()))
+    } else {
+        Err(format!(
+            "{}: {}",
+            tr("找不到既有的安裝資料夾", "No existing installation found"),
+            dir.display()
+        ))
+    };
+    match result {
+        Ok(()) => 0,
+        Err(e) => {
+            let body = to_wide(&format!("{}\n\n{e}", tr("CBX Shell 更新失敗。", "CBX Shell update failed.")));
+            let title = to_wide(tr("CBX Shell 更新", "CBX Shell update"));
+            unsafe {
+                MessageBoxW(HWND::default(), PCWSTR(body.as_ptr()), PCWSTR(title.as_ptr()), MB_OK | MB_ICONERROR);
+            }
+            // Bring the (old) manager back so the user is not left without it.
+            let mgr = dir.join("cbx-manager.exe");
+            if mgr.is_file() {
+                let _ = Command::new(&mgr).current_dir(&dir).spawn();
+            }
+            1
         }
     }
 }
@@ -418,6 +515,13 @@ fn perform_install(opts: &InstallOptions) -> Result<(), String> {
     }
 
     // Save user badge, language & general settings before registering DLL
+    // (an in-place update keeps everything the user configured).
+    if opts.preserve_settings {
+        if dll_target.exists() {
+            call_dll_entry(&dll_target, b"DllRegisterServer\0")?;
+        }
+        return finish_install(opts, dir, &uninst_path, &ico_path, total_bytes);
+    }
     current_lang().save();
     let mut settings = Settings::load();
     settings.badge_epub = false;
@@ -428,6 +532,9 @@ fn perform_install(opts: &InstallOptions) -> Result<(), String> {
     settings.enable_infotip = opts.enable_infotip;
     settings.position_seek = 25;
     settings.hdr_tonemap_enabled = opts.hdr_tonemap;
+    // A fresh install starts with activity logging off (it can be turned on in the manager).
+    settings.monitor_enabled = false;
+    settings.monitor_locked = false;
     settings.save();
 
     // Register cbxshell.dll if present in payload
@@ -467,6 +574,18 @@ fn perform_install(opts: &InstallOptions) -> Result<(), String> {
         }
     }
 
+    finish_install(opts, dir, &uninst_path, &ico_path, total_bytes)
+}
+
+/// Uninstall registration, shortcut, shell refresh and optional manager launch — shared by
+/// fresh installs and in-place updates.
+fn finish_install(
+    opts: &InstallOptions,
+    dir: &Path,
+    uninst_path: &Path,
+    ico_path: &Path,
+    total_bytes: u64,
+) -> Result<(), String> {
     // Register in Windows 10 / 11 "Installed Apps" (設定 > 應用程式 > 已安裝的應用程式)
     let dir_str = dir.to_string_lossy().into_owned();
     let mgr_path = dir.join("cbx-manager.exe");

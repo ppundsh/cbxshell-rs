@@ -7,7 +7,7 @@ use cbx_core::registry::{
 use cbx_core::settings::{
     to_wide, Settings, CLSID_CBXSHELL_RS, CLSID_CBXSHELL_RS_STR,
 };
-use cbx_core::{build_infotip, create_universal_thumbnail};
+use cbx_core::build_infotip;
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI32, AtomicU8, AtomicUsize, Ordering};
@@ -67,6 +67,18 @@ impl Drop for ObjectCountGuard {
     }
 }
 
+/// `WTS_E_FAILEDEXTRACTION`: extraction failed; Explorer shows the default icon and caches nothing.
+const WTS_E_FAILEDEXTRACTION_HR: HRESULT = HRESULT(0x8004_B200_u32 as i32);
+/// `WTS_E_EXTRACTIONTIMEDOUT`: extraction did not finish in time; Explorer may retry later.
+const WTS_E_EXTRACTIONTIMEDOUT_HR: HRESULT = HRESULT(0x8004_B201_u32 as i32);
+/// Applies the user's network share opt-in to path resolution in this process.
+fn apply_network_policy(settings: &cbx_core::settings::Settings) {
+    cbx_core::media::set_network_share_policy(cbx_core::media::NetworkSharePolicy::from_settings(
+        settings.allow_network_shares,
+        settings.network_lan_only,
+    ));
+}
+
 const PIPELINE_STREAM_RPC: u8 = 0;
 const PIPELINE_DIRECT_FILE: u8 = 1;
 const PIPELINE_IPC_HIT: u8 = 2;
@@ -117,6 +129,8 @@ struct CbxShellProvider {
     file_path: Mutex<Option<PathBuf>>,
     pipeline_kind: AtomicU8,
     settings: Settings,
+    /// Why path resolution fell back to the stream (shown in the monitor's trace column).
+    resolve_note: Mutex<String>,
 }
 
 impl CbxShellProvider {
@@ -127,6 +141,7 @@ impl CbxShellProvider {
             file_path: Mutex::new(None),
             pipeline_kind: AtomicU8::new(PIPELINE_STREAM_RPC),
             settings: Settings::load(),
+            resolve_note: Mutex::new(String::new()),
         }
     }
 }
@@ -170,6 +185,7 @@ impl IInitializeWithStream_Impl for CbxShellProvider_Impl {
         let Some(s) = pstream else {
             return Err(Error::from(E_INVALIDARG));
         };
+        apply_network_policy(&self.settings);
         let mut guard = self.stream.lock().map_err(|_| Error::from(E_FAIL))?;
         if guard.is_some() {
             return Err(Error::from(HRESULT::from_win32(ERROR_ALREADY_INITIALIZED.0)));
@@ -199,7 +215,7 @@ impl IInitializeWithStream_Impl for CbxShellProvider_Impl {
                         // STATSTG names are often bare file names (or names chosen by a third-party
                         // namespace extension). Only an absolute local path may be opened directly;
                         // anything else is used purely as an extension hint for the stream pipeline.
-                        let (resolved, kind) = if cbx_core::media::is_trusted_local_abs_path(&path) && path.is_file() {
+                        let (resolved, kind) = if cbx_core::media::is_openable_media_path(&path) && path.is_file() {
                             (Some(path), PIPELINE_DIRECT_FILE)
                         } else if is_video {
                             if let Some((p, src)) = cbx_core::media::resolve_file_from_name_with_source(&name_str, stat.cbSize) {
@@ -215,6 +231,10 @@ impl IInitializeWithStream_Impl for CbxShellProvider_Impl {
                                 };
                                 (Some(p), k)
                             } else {
+                                let note = cbx_core::media::take_resolve_note();
+                                if let Ok(mut n) = self.resolve_note.lock() {
+                                    *n = note;
+                                }
                                 (Some(path), PIPELINE_STREAM_RPC)
                             }
                         } else {
@@ -238,7 +258,7 @@ impl IInitializeWithStream_Impl for CbxShellProvider_Impl {
                     if !cur.is_null() {
                         if let Ok(full) = cur.to_string() {
                             if !full.is_empty()
-                                && cbx_core::media::is_trusted_local_abs_path(Path::new(&full))
+                                && cbx_core::media::is_openable_media_path(Path::new(&full))
                                 && Path::new(&full).is_file()
                             {
                                 if let Ok(mut fp) = self.file_path.lock() {
@@ -345,6 +365,18 @@ impl IThumbnailProvider_Impl for CbxShellProvider_Impl {
         let _worker_ext = ext_clone.clone();
         let worker_settings = settings.clone();
         let p_kind = self.pipeline_kind.load(Ordering::SeqCst);
+        let resolve_note = self.resolve_note.lock().map(|n| n.clone()).unwrap_or_default();
+        // Note first: the monitor's trace field is short, and the reason matters more than the label.
+        let with_note = move |label: String| if resolve_note.is_empty() { label } else { format!("{resolve_note} | {label}") };
+        let worker_with_note = with_note.clone();
+
+        // Placeholder cards ("corrupt video") are only correct when the actual local file was
+        // decoded and failed. For stream-only requests (network / UNC shares, Stream RPC) a failure
+        // or timeout must not hand Explorer a placeholder: Explorer caches it and keeps showing it
+        // even after a later request produces the real thumbnail. Those report an extraction error
+        // instead, which Explorer does not cache.
+        let direct_local_file = p_kind != PIPELINE_STREAM_RPC
+            && path_opt.as_ref().is_some_and(|p| p.is_file() && !cbx_core::media::is_allowed_network_path(p));
 
         // Pass raw COM pointer value safely to worker thread
         let stream_raw_val = stream_opt.as_ref().map(|s| s.as_raw() as usize);
@@ -373,7 +405,7 @@ impl IThumbnailProvider_Impl for CbxShellProvider_Impl {
                 }).flatten();
 
                 let path_pipeline = pipeline_label(p_kind);
-                let path_trace = resolve_trace_label(p_kind);
+                let path_trace = worker_with_note(resolve_trace_label(p_kind));
 
                 if let Some(ref path) = worker_path {
                     // A path that only came from the stream's STATSTG name is an extension hint,
@@ -433,7 +465,7 @@ impl IThumbnailProvider_Impl for CbxShellProvider_Impl {
                                 details: detail,
                             });
                         } else if let Some(ref stream) = worker_stream {
-                            let h = create_universal_thumbnail(stream, cx, &worker_settings, Some(&path.to_string_lossy()))
+                            let h = cbx_core::create_universal_thumbnail_no_placeholder(stream, cx, &worker_settings, Some(&path.to_string_lossy()))
                                 .map_err(|_| Error::from(E_FAIL))?;
                             let (w, h_px, buf) = hbitmap_to_bgra(h)?;
                             return Ok(DecodedImagePayload {
@@ -441,14 +473,14 @@ impl IThumbnailProvider_Impl for CbxShellProvider_Impl {
                                 height: h_px,
                                 bgra: buf,
                                 pipeline: pipeline_label(PIPELINE_STREAM_RPC),
-                                search_trace: resolve_trace_label(PIPELINE_STREAM_RPC),
+                                search_trace: worker_with_note(resolve_trace_label(PIPELINE_STREAM_RPC)),
                                 details: cbx_core::i18n::t_fmt("details.generic_stream", &[("cx", &cx.to_string())]),
                             });
                         }
                     } else if let Some(ref stream) = worker_stream {
                         let ext = path.extension().and_then(|e| e.to_str()).map(|e| format!(".{}", e.to_ascii_lowercase())).unwrap_or_default();
                         if cbx_core::media::is_video_extension(&ext) {
-                            let h = create_universal_thumbnail(stream, cx, &worker_settings, Some(&path.to_string_lossy()))
+                            let h = cbx_core::create_universal_thumbnail_no_placeholder(stream, cx, &worker_settings, Some(&path.to_string_lossy()))
                                 .map_err(|_| Error::from(E_FAIL))?;
                             let (w, h_px, buf) = hbitmap_to_bgra(h)?;
                             return Ok(DecodedImagePayload {
@@ -456,7 +488,7 @@ impl IThumbnailProvider_Impl for CbxShellProvider_Impl {
                                 height: h_px,
                                 bgra: buf,
                                 pipeline: pipeline_label(PIPELINE_STREAM_RPC),
-                                search_trace: resolve_trace_label(PIPELINE_STREAM_RPC),
+                                search_trace: worker_with_note(resolve_trace_label(PIPELINE_STREAM_RPC)),
                                 details: cbx_core::i18n::t_fmt("details.video_stream", &[("cx", &cx.to_string())]),
                             });
                         } else {
@@ -469,7 +501,7 @@ impl IThumbnailProvider_Impl for CbxShellProvider_Impl {
                                 height: h_px,
                                 bgra: buf,
                                 pipeline: pipeline_label(PIPELINE_STREAM_RPC),
-                                search_trace: resolve_trace_label(PIPELINE_STREAM_RPC),
+                                search_trace: worker_with_note(resolve_trace_label(PIPELINE_STREAM_RPC)),
                                 details: detail,
                             });
                         }
@@ -484,7 +516,7 @@ impl IThumbnailProvider_Impl for CbxShellProvider_Impl {
                         height: h_px,
                         bgra: buf,
                         pipeline: pipeline_label(PIPELINE_STREAM_RPC),
-                        search_trace: resolve_trace_label(PIPELINE_STREAM_RPC),
+                        search_trace: worker_with_note(resolve_trace_label(PIPELINE_STREAM_RPC)),
                         details: detail,
                     });
                 }
@@ -510,7 +542,7 @@ impl IThumbnailProvider_Impl for CbxShellProvider_Impl {
             }
             Ok(Ok(Err(_))) | Ok(Err(_)) => {
                 let err_pipeline = pipeline_label(p_kind);
-                let err_trace = resolve_trace_label(p_kind);
+                let err_trace = with_note(resolve_trace_label(p_kind));
                 if !cbx_core::media::is_video_extension(&ext_clone) {
                     // User Requirement:
                     // For archive files without images (e.g. a backup archive holding only documents),
@@ -520,6 +552,13 @@ impl IThumbnailProvider_Impl for CbxShellProvider_Impl {
                         cbx_core::monitor::record_task_end_with_trace(guard, true, &err_pipeline, &err_trace, &cbx_core::i18n::t("details.no_cover_image"));
                     }
                     return Err(Error::from(E_FAIL));
+                }
+
+                if !direct_local_file {
+                    if let Some(guard) = task_guard {
+                        cbx_core::monitor::record_task_end_with_trace(guard, false, &err_pipeline, &err_trace, &cbx_core::i18n::t("details.video_decode_failed"));
+                    }
+                    return Err(Error::from(WTS_E_FAILEDEXTRACTION_HR));
                 }
 
                 // Fallback card on decode error for video files
@@ -544,7 +583,7 @@ impl IThumbnailProvider_Impl for CbxShellProvider_Impl {
             Err(_) => {
                 // TIMEOUT WATCHDOG TRIGGERED!
                 let err_pipeline = pipeline_label(p_kind);
-                let err_trace = resolve_trace_label(p_kind);
+                let err_trace = with_note(resolve_trace_label(p_kind));
                 let cur_stage = cbx_core::monitor::get_current_stage();
                 let stage_desc = if cur_stage.is_empty() {
                     cbx_core::i18n::t("details.stream_or_decode_timeout")
@@ -561,6 +600,12 @@ impl IThumbnailProvider_Impl for CbxShellProvider_Impl {
                         cbx_core::monitor::record_task_end_with_trace(guard, false, &err_pipeline, &err_trace, &timeout_details);
                     }
                     return Err(Error::from(E_FAIL));
+                }
+                if !direct_local_file {
+                    if let Some(guard) = task_guard {
+                        cbx_core::monitor::record_task_end_with_trace(guard, false, &err_pipeline, &err_trace, &timeout_details);
+                    }
+                    return Err(Error::from(WTS_E_EXTRACTIONTIMEDOUT_HR));
                 }
 
                 let label = cbx_core::static_ext_label(&ext_clone);
@@ -605,9 +650,14 @@ impl IPersistFile_Impl for CbxShellProvider_Impl {
         if s.is_empty() {
             return Err(Error::from(E_INVALIDARG));
         }
+        apply_network_policy(&self.settings);
+        let path = PathBuf::from(s);
+        // Only local paths (or network shares the user allowed) are opened directly; anything else
+        // is kept purely as a name / extension hint.
+        let kind = if cbx_core::media::is_openable_media_path(&path) { PIPELINE_DIRECT_FILE } else { PIPELINE_STREAM_RPC };
         let mut guard = self.file_path.lock().map_err(|_| Error::from(E_FAIL))?;
-        *guard = Some(PathBuf::from(s));
-        self.pipeline_kind.store(PIPELINE_DIRECT_FILE, Ordering::SeqCst);
+        *guard = Some(path);
+        self.pipeline_kind.store(kind, Ordering::SeqCst);
         Ok(())
     }
 

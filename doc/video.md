@@ -65,7 +65,9 @@ flowchart TD
    - Evaluates luminance and Shannon entropy on candidate frames with progressive stepping.
    - Runs confined: local-file protocol only, container (`-format_whitelist`) and decoder (`-codec_whitelist`) allowlists, video stream only (`-an -sn -dn`), started suspended inside a restrictive Job Object. Files using a codec outside the allowlist fall back to the procedural card (see [`security.md` §4–5](./security.md)).
 3. **Fast Recovery Fallback**:
-   - If files are corrupted or FFmpeg is missing, the engine returns `S_OK` with a procedural video badge card instead of `E_FAIL` (which causes Windows Explorer to stall for up to 30 seconds polling legacy DirectShow decoders), ensuring responsive shell browsing.
+   - If files are corrupted or FFmpeg is missing, the engine returns `S_OK` with a procedural video badge card instead of `E_FAIL` (which causes Windows Explorer to stall for up to 30 seconds polling legacy DirectShow decoders), ensuring responsive shell browsing — only when the local file itself was opened and failed to decode.
+   - **FFmpeg fallback for streams**: when Media Foundation cannot decode a stream (FLV, many MKV …), FFmpeg reads it through stdin (only the `pipe` protocol allowed) with **the same algorithm parameters** as the file pipeline (frame-selection policy, duration percentage, skip offset, duration threshold, step interval, probe limit, luminance / entropy scoring, time budget, HDR tone-mapping): the first 2 MiB are fed to read the duration and HDR hints; for each candidate the byte position is estimated as target ÷ duration × stream size, and the container head plus 12 MiB around that position are fed so the demuxer resynchronises and the first frame at or after the target is taken; targets near the start are fed contiguously and located with an output-side `-ss`. Only if every candidate fails is the first frame used.
+   - **Exception — stream-only files** (network / UNC shares, the Stream RPC pipeline): on failure or timeout **no** card is produced; the provider returns `WTS_E_FAILEDEXTRACTION` / `WTS_E_EXTRACTIONTIMEDOUT` instead. Explorer shows the default icon and caches nothing, whereas a cached failure card would keep covering the real thumbnail produced by a later request.
 
 ---
 
@@ -84,4 +86,4 @@ flowchart TD
 ## 5. Performance & Watchdog Timeouts
 
 - **Configurable Watchdog**: Timeout budget (default 12s, range 3s to 60s).
-- **Diagnostics Recording**: Captures detailed stage, execution time, and resolution metrics in the Live Activity Monitor to facilitate troubleshooting.
+- **Diagnostics Recording**: Captures detailed stage, execution time, and resolution metrics in the Live Activity Monitor to facilitate troubleshooting. Logging is off by default (also after a fresh install); unless the 🔒 lock next to the switch is engaged, it stops on its own 10 minutes after being turned on (enforced by the extension itself, so it expires even with the manager closed). Auto-stop keeps the recorded entries for export.

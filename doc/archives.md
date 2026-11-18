@@ -33,3 +33,20 @@ To preserve CJK filenames accurately, the engine reads raw filename bytes direct
 - **Border Decoration Styles**: Supports 6 styles (`No Frame`, `Round Only` / borderless rounded corners, `Filmstrip`, `Drop Shadow`, `Photo Frame`, `Book Cover`) configurable per media category.
 - **Neutral Archive Icon Fallback**:
   If an archive contains no images, the engine returns `E_FAIL` so Windows Explorer preserves the default system archive icon. The event is recorded objectively as "No Cover Image" (normal completion), not an error.
+
+---
+
+## 4. Partial Reads: Only the Bytes That Are Needed
+
+A thumbnail never needs the whole archive. Each format reads only what is required to *find* the cover and to *decode* it, so network shares, cloud placeholders and large files transfer only a small fraction of their size:
+
+| Format | What is read | Notes |
+|---|---|---|
+| **ZIP / CBZ** | Tail (≤ 64 KiB) → central directory → cover entry | The central directory sits at the end of the file; once the cover is chosen the reader jumps straight to its local header and data. Other entries' data is never read. |
+| **RAR / CBR** | Block headers one by one (data skipped with seeks) → cover entry | Every entry is preceded by a self-describing header; headers are read through a 4 KiB window, their CRC is verified, and the data area is skipped. With natural sorting off the walk stops at the first usable image; with it on, only headers are walked. Then just *signature + main header + the cover's block* are assembled into a small archive for the decoder. A **solid** entry needs every block from the start of its solid group up to the end of its data (solid streams cannot be decoded from the middle). |
+| **7z / CB7** | Signature header (32 B) → end header → the cover's data block | Headers sit at the end; blocks are decoded in order, and a solid block must be decoded from its start (bounded by the 128 MiB drain cap and the deadline). |
+| **TAR / CBT** | 512-byte headers one by one (data skipped with seeks) → cover entry | The first pass walks headers only and records each candidate's data position; the chosen entry is then read directly. |
+
+When the RAR fast path meets an unusual layout (encrypted headers, a non-standard SFX) or the decoder rejects the minimal archive, it falls back to the previous "read a 16–96 MiB prefix and parse it" path, so compatibility is unchanged.
+
+> Random access is still required: ZIP and 7z keep their directory at the end, so the reader must be able to seek there; RAR and TAR headers are spread across the file. If a file is still downloading or being copied and does not yet contain the cover, thumbnail extraction fails; it succeeds once the file is complete.

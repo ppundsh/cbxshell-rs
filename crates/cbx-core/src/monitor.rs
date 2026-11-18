@@ -368,7 +368,12 @@ pub fn get_current_stage() -> String {
 
 pub fn record_task_begin(file_name: &str, ext: &str) -> Option<TaskGuard> {
     let settings = crate::settings::Settings::load();
-    if !settings.monitor_enabled {
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // Unlocked logging expires on its own even when the manager is not running.
+    if !settings.monitor_effective(now_secs) {
         return None;
     }
 

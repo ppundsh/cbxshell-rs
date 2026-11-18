@@ -1,10 +1,10 @@
+# 完整的新版 .github/workflows/release.yml（請手動覆蓋原檔後提交）
 name: Release
 
 on:
   push:
     tags:
       - 'v*'
-  workflow_dispatch:
 
 permissions:
   contents: read
@@ -12,6 +12,8 @@ permissions:
 jobs:
   build-and-release:
     runs-on: windows-latest
+    # 簽章私鑰只放在這個 Environment；每次執行都要你在 GitHub 網頁上按「Approve」。
+    environment: release
     permissions:
       contents: write
     steps:
@@ -19,6 +21,32 @@ jobs:
         uses: actions/checkout@v4
         with:
           persist-credentials: false
+          fetch-depth: 0
+
+      - name: Verify tag is signed by a release approver (YubiKey OpenPGP)
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $gpg = 'C:\Program Files\Git\usr\bin\gpg.exe'
+          git fetch --force origin "refs/tags/${tag}:refs/tags/$tag"
+          Invoke-WebRequest "https://github.com/${{ github.repository_owner }}.gpg" -OutFile "$env:RUNNER_TEMP/owner.gpg"
+          & $gpg --batch --import "$env:RUNNER_TEMP/owner.gpg"
+          $raw = git -c gpg.program="$gpg" verify-tag --raw $tag 2>&1 | Out-String
+          if ($LASTEXITCODE -ne 0) { throw "tag signature invalid`n$raw" }
+          $fpr = ([regex]'VALIDSIG ([0-9A-F]{40})').Match($raw).Groups[1].Value
+          if (-not $fpr) { throw "no valid signature on $tag`n$raw" }
+          $ssh = (& $gpg --export-ssh-key "$fpr!") -split '\s+'
+          $line = "openpgp $($ssh[0]) $($ssh[1])"
+          if (-not (Select-String -LiteralPath assets/release-approvers.pub -SimpleMatch $line -Quiet)) {
+            throw "tag signed by $fpr, which is not a release approver"
+          }
+          Write-Host "Tag $tag signed by release approver $fpr"
+
+      - name: Verify tag matches Cargo version
+        shell: pwsh
+        run: |
+          $v = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"(.+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          if ("v$v" -ne "${{ github.ref_name }}") { throw "Tag ${{ github.ref_name }} != Cargo version v$v" }
 
       - name: Install Rust stable toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -39,10 +67,22 @@ jobs:
           if (!(Test-Path "dist")) { New-Item -ItemType Directory -Path "dist" -Force | Out-Null }
           git archive --format=zip --output="dist/CBXShell-Source.zip" HEAD
 
-      - name: Publish GitHub Release
+      - name: Sign installer & write latest.json
+        shell: pwsh
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.CBX_UPDATER_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.CBX_UPDATER_KEY_PASSWORD }}
+        run: .\release-manifest.ps1 -Tag "${{ github.ref_name }}"
+
+      # 草稿不會出現在 releases/latest，使用者收不到；
+      # 由你在本機執行 scripts\approve-release.ps1 用 YubiKey 核准後才發布。
+      - name: Create draft release
         uses: softprops/action-gh-release@v2
         with:
+          draft: true
           files: |
             dist/CBXShell-Setup.exe
+            dist/CBXShell-Setup.exe.sig
+            dist/latest.json
             dist/CBXShell-Source.zip
           generate_release_notes: true

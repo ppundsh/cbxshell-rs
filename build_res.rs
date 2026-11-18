@@ -27,6 +27,7 @@ pub fn harden_exe_linker() {
 }
 
 pub fn compile_pe_resources(meta: &PeMetadata) {
+    println!("cargo:rerun-if-env-changed=CARGO_PKG_VERSION");
     let target = env::var("TARGET").unwrap_or_default();
     if !target.contains("windows") {
         return;
@@ -58,11 +59,19 @@ pub fn compile_pe_resources(meta: &PeMetadata) {
         String::new()
     };
 
+    // Version resource is derived from the crate version (workspace `version` in Cargo.toml),
+    // so `bump-version.ps1` is the only place a release number ever has to change.
+    let ver = |k: &str| env::var(k).ok().and_then(|v| v.parse::<u16>().ok()).unwrap_or(0);
+    let (v_major, v_minor, v_patch) = (
+        ver("CARGO_PKG_VERSION_MAJOR"),
+        ver("CARGO_PKG_VERSION_MINOR"),
+        ver("CARGO_PKG_VERSION_PATCH"),
+    );
     let rc_content = format!(
         "{header}\
          1 VERSIONINFO\r\n\
-         FILEVERSION 0,1,0,0\r\n\
-         PRODUCTVERSION 0,1,0,0\r\n\
+         FILEVERSION {v_major},{v_minor},{v_patch},0\r\n\
+         PRODUCTVERSION {v_major},{v_minor},{v_patch},0\r\n\
          FILEFLAGSMASK 0x3fL\r\n\
          FILEFLAGS 0x0L\r\n\
          FILEOS 0x40004L\r\n\
@@ -75,12 +84,12 @@ pub fn compile_pe_resources(meta: &PeMetadata) {
                  BEGIN\r\n\
                      VALUE \"CompanyName\", \"CBXShell Open Source Project\\0\"\r\n\
                      VALUE \"FileDescription\", \"{desc}\\0\"\r\n\
-                     VALUE \"FileVersion\", \"0.1.0.0\\0\"\r\n\
+                     VALUE \"FileVersion\", \"{v_major}.{v_minor}.{v_patch}.0\\0\"\r\n\
                      VALUE \"InternalName\", \"{internal}\\0\"\r\n\
                      VALUE \"LegalCopyright\", \"GNU General Public License v3.0\\0\"\r\n\
                      VALUE \"OriginalFilename\", \"{orig_file}\\0\"\r\n\
                      VALUE \"ProductName\", \"CBX Shell\\0\"\r\n\
-                     VALUE \"ProductVersion\", \"0.1.0.0\\0\"\r\n\
+                     VALUE \"ProductVersion\", \"{v_major}.{v_minor}.{v_patch}.0\\0\"\r\n\
                  END\r\n\
              END\r\n\
              BLOCK \"VarFileInfo\"\r\n\
@@ -93,6 +102,9 @@ pub fn compile_pe_resources(meta: &PeMetadata) {
         desc = meta.file_description,
         internal = meta.internal_name,
         orig_file = meta.original_filename,
+        v_major = v_major,
+        v_minor = v_minor,
+        v_patch = v_patch,
     );
 
     fs::write(&rc_path, rc_content).expect("Failed to write version.rc");

@@ -56,6 +56,7 @@ flowchart TD
    - 提取 `STATSTG.pwcsName` 檔名與 `cbSize` 檔案大小（拒絕 UNC 網路路徑與裝置路徑）；
    - 僅在 `cbSize` 已知（非 0）時執行；所有候選檔大小須完全相符，且 TypedPaths／`.lnk`／快取目錄只在本機固定或卸除式磁碟上追蹤（詳見 [`security.zh-TW.md` §6](./security.zh-TW.md)）；
    - 依序探測 **1. 最後命中目錄快取（`LAST_FOUND_DIR`）** → **2. Everything IPC 全磁碟索引** → **3. 目前工作目錄（CWD）** → **4. 總管網址列歷史（`TypedPaths` url1~5）** → **5. 標準使用者目錄（Downloads、Videos、Desktop、Documents）** → **6. Windows 最近開啟捷徑（`Recent/*.lnk`）** → **7. 邏輯磁碟根目錄**。
+   - **本機優先**：同一個檔案常同時存在於本機磁碟與 NAS（檔名、大小都相同）。Everything 的多筆結果會先驗證本機磁碟、再驗證網路共用與網路磁碟機（同組內以上次命中目錄優先）；若最後命中目錄快取是網路位置，則延到 Everything 之後才嘗試，避免瀏覽過 NAS 後連本機縮圖都走網路。
 2. **切換至零 RPC 原生解碼管線**：
    - 一旦檔名與 `cbSize` 位元組大小精確吻合，立即寫入 `file_path` 並記錄命中來源（如 `IPC Hit`、`Search Hit`）；
    - 進入背景解碼執行緒後，影片分支不再讀取原本的 COM `IStream`，而是直接將實體路徑交由 `extract_video_thumbnail_from_path` 調用 `MFCreateSourceReaderFromURL`（DXVA 硬體加速）或 FFmpeg 進行關鍵影格取樣與智慧評分（亮度 + 香農熵）。
@@ -89,4 +90,4 @@ flowchart TD
    - 當 Media Foundation 解碼失敗（如 10-bit H.264 Hi10P 等 WMF 不支援之編碼），且已取得影片實體路徑、系統已安裝 FFmpeg 或設定自訂路徑時，切換至外部解碼器執行影格提取；FFmpeg 以受限沙盒執行（詳見 [`security.zh-TW.md` §4–5](./security.zh-TW.md)）。
    - 縮圖影格（透過 `image2pipe` 輸出之 MJPEG 串流）經由 stdout 管道流直接載入記憶體，**全程無磁碟暫存寫入**，兼顧隱私與磁碟壽命。
 3. **終端防護：安全救援機制（Fast Recovery）**：
-   若檔案損毀或解碼失敗，不回傳 `E_FAIL`，改由記憶體生成帶格式角標之影片樣式卡片並回傳 `S_OK`，避免觸發 Windows 總管舊版 DirectShow 30 秒輪詢阻塞。
+   若直接開啟的本機檔案損毀或解碼失敗，不回傳 `E_FAIL`，改由記憶體生成帶格式角標之影片樣式卡片並回傳 `S_OK`，避免觸發 Windows 總管舊版 DirectShow 30 秒輪詢阻塞。只能透過串流取得的檔案（網路／UNC 共用資料夾）失敗或逾時時改回傳 `WTS_E_FAILEDEXTRACTION`／`WTS_E_EXTRACTIONTIMEDOUT`，避免檔案總管快取失敗卡片。

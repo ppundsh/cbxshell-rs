@@ -11,3 +11,8 @@ Thumbs.db
 /run-checks.cmd
 /purge-history.cmd
 /purge-history.ps1
+/run-checks.ps1
+# Exported from the manager ("Export activity log"); may contain local paths
+/cbxshell-activity-log.txt
+# Private maintainer notes (release / YubiKey procedures) — never pushed
+/private/

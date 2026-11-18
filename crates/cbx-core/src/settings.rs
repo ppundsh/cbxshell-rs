@@ -312,6 +312,43 @@ pub struct Settings {
     pub prefer_continuous_sequence: bool,
     /// Comma-separated custom extensions for plain text thumbnails in the "Other" category (e.g., "nfo, cfg").
     pub custom_text_extensions: String,
+    /// Allow opening media directly on network shares (UNC paths / mapped network drives) and
+    /// accepting Everything index hits there. Off by default: reading a share makes the shell
+    /// host connect to that server with the user's Windows credentials.
+    pub allow_network_shares: bool,
+    /// When network shares are allowed, restrict them to servers on the local network
+    /// (single-label / .local-style names and private IP addresses). On by default.
+    pub network_lan_only: bool,
+    /// Check GitHub Releases for a newer signed version when the manager starts (at most once a
+    /// day). Nothing is downloaded or installed without the user clicking "Install".
+    pub auto_check_updates: bool,
+    /// Unix time (seconds) of the last successful update check; throttles the automatic check.
+    pub last_update_check: u32,
+    /// Keep activity logging on indefinitely. When false, logging switches itself off
+    /// `MONITOR_AUTO_OFF_SECS` after it was enabled (so it is never left on by accident).
+    pub monitor_locked: bool,
+    /// Unix time (seconds) when activity logging was last switched on.
+    pub monitor_enabled_at: u32,
+}
+
+/// Unlocked activity logging turns itself off after this many seconds.
+pub const MONITOR_AUTO_OFF_SECS: u64 = 10 * 60;
+
+impl Settings {
+    /// Whether activity logging is effectively on at `now` (Unix seconds): enabled and either
+    /// locked or still inside the auto-off window.
+    pub fn monitor_effective(&self, now: u64) -> bool {
+        self.monitor_enabled
+            && (self.monitor_locked || now.saturating_sub(self.monitor_enabled_at as u64) < MONITOR_AUTO_OFF_SECS)
+    }
+
+    /// Seconds left before unlocked logging switches off (`None` when off or locked).
+    pub fn monitor_seconds_left(&self, now: u64) -> Option<u64> {
+        if !self.monitor_enabled || self.monitor_locked {
+            return None;
+        }
+        Some(MONITOR_AUTO_OFF_SECS.saturating_sub(now.saturating_sub(self.monitor_enabled_at as u64)))
+    }
 }
 
 impl Default for Settings {
@@ -363,6 +400,12 @@ impl Default for Settings {
             border_ebook: 4, // Default 4 = BookCover
             prefer_continuous_sequence: true,
             custom_text_extensions: String::new(),
+            allow_network_shares: false,
+            network_lan_only: true,
+            auto_check_updates: true,
+            last_update_check: 0,
+            monitor_locked: false,
+            monitor_enabled_at: 0,
         }
     }
 }
@@ -677,6 +720,24 @@ impl Settings {
         if let Some(v) = read_string(hk, "CustomTextExtensions") {
             s.custom_text_extensions = v;
         }
+        if let Some(v) = read_dword(hk, "AllowNetworkShares") {
+            s.allow_network_shares = v != 0;
+        }
+        if let Some(v) = read_dword(hk, "NetworkLanOnly") {
+            s.network_lan_only = v != 0;
+        }
+        if let Some(v) = read_dword(hk, "AutoCheckUpdates") {
+            s.auto_check_updates = v != 0;
+        }
+        if let Some(v) = read_dword(hk, "LastUpdateCheck") {
+            s.last_update_check = v;
+        }
+        if let Some(v) = read_dword(hk, "MonitorLocked") {
+            s.monitor_locked = v != 0;
+        }
+        if let Some(v) = read_dword(hk, "MonitorEnabledAt") {
+            s.monitor_enabled_at = v;
+        }
 
         // SAFETY: hk was opened above.
         let _ = unsafe { RegCloseKey(hk) };
@@ -799,7 +860,13 @@ impl Settings {
             && write_dword(hk, "WatchdogTimeoutSec", self.watchdog_timeout_sec.clamp(3, 60))
             && write_dword(hk, "BorderEbook", self.border_ebook.clamp(0, 5))
             && write_dword(hk, "PreferContinuousSequence", u32::from(self.prefer_continuous_sequence))
-            && write_string(hk, "CustomTextExtensions", &self.custom_text_extensions);
+            && write_string(hk, "CustomTextExtensions", &self.custom_text_extensions)
+            && write_dword(hk, "AllowNetworkShares", u32::from(self.allow_network_shares))
+            && write_dword(hk, "NetworkLanOnly", u32::from(self.network_lan_only))
+            && write_dword(hk, "AutoCheckUpdates", u32::from(self.auto_check_updates))
+            && write_dword(hk, "LastUpdateCheck", self.last_update_check)
+            && write_dword(hk, "MonitorLocked", u32::from(self.monitor_locked))
+            && write_dword(hk, "MonitorEnabledAt", self.monitor_enabled_at);
 
         // SAFETY: hk was created above.
         let _ = unsafe { RegCloseKey(hk) };

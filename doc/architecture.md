@@ -56,6 +56,7 @@ flowchart TD
    - Extracts filename from `STATSTG.pwcsName` and file size `cbSize` (rejecting UNC network and device paths).
    - Runs only when `cbSize` is known (non-zero); every candidate must match it exactly, and TypedPaths / `.lnk` / cached directories are followed only on local fixed or removable drives (see [`security.md` §6](./security.md)).
    - Probes in order: **1. `LAST_FOUND_DIR` cache** → **2. Everything IPC NTFS index** → **3. Working directory (CWD)** → **4. Explorer `TypedPaths` (`url1~5`)** → **5. Standard user folders (`Downloads`, `Videos`, `Desktop`, `Documents`)** → **6. Windows `Recent/*.lnk` shortcuts** → **7. Logical drive roots**.
+   - **Local first**: the same file often exists both on a local disk and on a NAS (same name and size). Multiple Everything hits are validated local disks first, then network shares and mapped network drives (within each group the last resolved directory wins); a `LAST_FOUND_DIR` that points to a network location is only tried after Everything, so browsing the NAS no longer makes local thumbnails go over the network.
 2. **Switch to Zero-RPC Native Decoding**:
    - Once filename and exact `cbSize` match, CBX Shell stores the resolved `file_path` and tags the pipeline source (e.g., `IPC Hit`, `Search Hit`).
    - On the background worker thread, the video branch discards the COM `IStream` and passes the native path directly to `extract_video_thumbnail_from_path`, invoking `MFCreateSourceReaderFromURL` (DXVA hardware acceleration) or FFmpeg for keyframe extraction and smart frame scoring (luminance + Shannon entropy).
@@ -89,4 +90,4 @@ flowchart TD
    - When Media Foundation fails (e.g. 10-bit H.264 Hi10P, unusual MKV/WebM containers, ProRes) and a physical path is available, decoding shifts to `ffmpeg.exe`, which runs inside a restricted sandbox (see [`security.md` §4–5](./security.md)).
    - Encoded candidate frames (MJPEG via `image2pipe`) are ingested into memory directly via **stdout pipe streams**, writing zero temporary files to disk.
 3. **Tier 3: Fast Recovery Safe Procedural Cards**:
-   If decoding fails or files are damaged, the provider returns `S_OK` with a clean procedural format card instead of `E_FAIL` (which prompts Windows Explorer to stall for 30 seconds polling legacy DirectShow decoders).
+   If a directly opened local file is damaged or fails to decode, the provider returns `S_OK` with a clean procedural format card instead of `E_FAIL` (which prompts Windows Explorer to stall for 30 seconds polling legacy DirectShow decoders). Stream-only files (network / UNC shares) return `WTS_E_FAILEDEXTRACTION` / `WTS_E_EXTRACTIONTIMEDOUT` on failure or timeout instead, so Explorer never caches a failure card over the real thumbnail.

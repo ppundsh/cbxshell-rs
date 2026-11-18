@@ -9,6 +9,7 @@ CBX Shell 遵循零信任（Zero-Trust）原則，預設所有外部輸入、壓
 解碼與解壓縮作業針對高壓縮比項目（Zip Bomb、Solid Block Bomb）、偽造檔頭與解析器 OOM 建構了多層上限機制：
 - **最大解壓位元組限制**：單一候選封面圖檔解壓縮上限受限於設定值（預設 256 MiB，可配置範圍 8～2047 MiB），採用分塊串流讀取，不直接信任檔頭宣告的配置長度。
 - **解壓前後雙重壓縮比例檢查**：當項目大於 8 MiB 時，若壓縮比例超過 200:1 或壓縮大小偽造為 `0`，於解壓前即予拒絕；實際解壓完成後亦會以真實位元組長度再次驗證 200:1 上限，防範偽造檔頭繞過。
+- **RAR 讀取上限**：RAR 以 seek 逐一走訪區塊標頭（每個標頭驗證 CRC、單一標頭 ≤ 2 MiB），只讀取封面所屬區塊（固實項目為其固實群組到封面為止），總量上限 16–96 MiB；無法以快速路徑處理時才退回有上限的前綴讀取。
 - **固實壓縮（Solid Archive）耗損上限**：對 7z / RAR 固實壓縮區塊，設定累計讀取位元組上限（128 MiB）與掃描逾時預算，限制 CPU 與磁碟 I/O 消耗。
 - **影像尺寸上限與降採樣淨化**：透過 `image::Limits` 限制最大寬高 `16384` px、最大像素 `64,000,000` 及解碼記憶體 `256 MiB`；縮圖輸出經 `CatmullRom` 重採樣降採樣以消除 LSB 隱寫與縮放攻擊特徵，並透過 `detect_image_trailer_overhang` 偵測圖種（Polyglot）附加資料並標記 `RISK`。
 - **文件與音訊封面解析強化**：
@@ -90,7 +91,7 @@ CBX Shell 遵循零信任（Zero-Trust）原則，預設所有外部輸入、壓
 
 2. **Everything IPC 防偽裝與路徑驗證**：
    - **IPC 視窗行程驗證**：查詢 `EVERYTHING_TASKBAR_NOTIFICATION` 前，先透過 `GetWindowThreadProcessId` 與 `QueryFullProcessImageNameW` 檢查視窗所屬執行檔是否為位於本機非暫存目錄的 `Everything.exe` / `Everything64.exe`，防止同 Session 惡意程式偽造 IPC 視窗回傳。
-   - **回傳結果嚴格校驗**：僅接受本機磁碟（`DRIVE_FIXED` / `DRIVE_REMOVABLE`）路徑（阻擋 UNC/SMB NTLM 憑證外洩），拒絕 `..` 遍歷與 ADS 冒號，並強制比對回傳檔名與檔案位元組大小（`expected_size`）完全相符；查詢字串亦過濾引號與控制字元。
+   - **回傳結果嚴格校驗**：預設僅接受本機磁碟（`DRIVE_FIXED` / `DRIVE_REMOVABLE`）路徑（阻擋 UNC/SMB NTLM 憑證外洩；使用者明確允許網路共用資料夾時，改依 §6 的網路政策判斷），拒絕 `..` 遍歷與 ADS 冒號，並強制比對回傳檔名與檔案位元組大小（`expected_size`）完全相符；查詢字串亦過濾引號與控制字元。
 
 3. **系統工具絕對路徑呼叫**：
    - 清除縮圖快取重啟檔案總管時，以 `GetSystemWindowsDirectoryW` 回報的 Windows 目錄（絕不寫死磁碟代號）組出 `taskkill.exe` 與 `explorer.exe` 絕對路徑，搭配系統 `current_dir` 執行，不經由 `cmd.exe` 或 `PATH` 搜尋路徑。
@@ -101,7 +102,9 @@ CBX Shell 遵循零信任（Zero-Trust）原則，預設所有外部輸入、壓
 
 在處理序隔離模式下，Shell 交給擴充元件的是 `IStream`；隨附的 `STATSTG::pwcsName` 經常只是「單純檔名」（或由第三方命名空間擴充，例如 ZIP 資料夾、雲端供應者所決定的名稱）。舊版直接對該名稱呼叫 `Path::is_file()`，而這會以宿主行程的**目前工作目錄**解析，導致某項目的縮圖可能由另一個同名但不相干的本機檔案產生。
 
-- 只有通過 `media::is_trusted_local_abs_path` 的名稱才會直接開啟：必須是磁碟代號開頭的絕對路徑，且不含 UNC／裝置前綴（`\\server`、`\\?\`、`\\.\`）、ADS 冒號、控制字元與 `..` 元件；否則僅作為副檔名提示，實際位元組一律來自串流。
+- 只有通過 `media::is_openable_media_path` 的名稱才會直接開啟：預設必須是**非網路磁碟**上、磁碟代號開頭的絕對路徑（`is_trusted_local_abs_path`），且不含 UNC／裝置前綴（`\\server`、`\\?\`、`\\.\`）、ADS 冒號、控制字元與 `..` 元件；否則僅作為副檔名提示，實際位元組一律來自串流。
+- **網路共用資料夾為選擇性開啟**（控制中心 → 影片 →「允許讀取網路共用資料夾」，預設關閉，開啟時會跳出警告）：開啟後 UNC 路徑、對應的網路磁碟機與 Everything 對網路位置的結果才會被直接開啟。子選項「只能讀取區域網路」預設開啟，只接受私有／鏈結本機／迴路 IP、單一名稱（NetBIOS／LLMNR）與 `.local`、`.lan`、`.home.arpa` 等區域網路名稱的伺服器；判斷**完全不做 DNS 查詢**，WebDAV（`\\host@SSL\…`）與裝置命名空間永遠拒絕。對應的網路磁碟機以 `QueryDosDeviceW` 取得實際伺服器後套用同一規則。
+- 串流無法由 Media Foundation 解碼時（FLV、許多 MKV、Hi10P 等），會把串流的開頭與目標位置附近的資料經**標準輸入**交給 FFmpeg（`-protocol_whitelist pipe`，其餘白名單與沙盒完全相同），宿主程序本身不開檔、也不連線網路。
 - 影片的名稱式後備解析（快取 → Everything → CWD → TypedPaths → 使用者資料夾 → 最近使用 → 磁碟根目錄）在**串流大小未知（0）時完全停用**，且所有候選檔案的大小都必須與串流完全相符。
 - `TypedPaths` 項目、`.lnk` 目標與最後目錄快取只會在本機固定／卸除式磁碟上追蹤，網址列歷史或捷徑永遠無法觸發對外 SMB/WebDAV 連線（NTLM 雜湊外洩）或網路卡頓。
 - 第三方串流的 `IStream::Read` 結果會被驗證（`read_bytes ≤ 要求長度`）、`BufferedIStream::Seek` 改用溢位檢查運算，縮圖邊長要求鉗位於 16–2560 px。
@@ -123,6 +126,7 @@ CBX Shell 遵循零信任（Zero-Trust）原則，預設所有外部輸入、壓
 ## 8. 執行檔與供應鏈強化
 
 - **DLL 植入**：`CBXShell-Setup.exe`、`cbx-manager.exe` 與 `cbx-cli.exe` 以 `/DEPENDENTLOADFLAG:0x800` 連結（靜態匯入僅從 System32 解析），並於啟動時呼叫 `SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32)`；放在「下載」資料夾中安裝程式旁的 `version.dll`／`dwmapi.dll` 永遠不會被載入。（GNU 工具鏈沒有對應的連結器旗標，但執行期呼叫仍然有效。）
+- **自動更新**：下載的安裝檔必須通過內建公鑰的 minisign（Ed25519）簽章驗證才會執行；清單網址限定本儲存庫的 Release 資產、只接受較新版本；另需維護者以 YubiKey（FIDO2，PIN＋觸碰）簽署的版本＋SHA-256 核准，因此 GitHub 帳號、CI 或簽章私鑰單獨外洩都無法推送更新。詳見 [安裝、版本檢測與自動更新](./updates.zh-TW.md)。
 - **解除安裝程式重新啟動**：為解除安裝資料夾鎖定而建立的自我複本，改放在 `%TEMP%` 下新建、名稱唯一的子資料夾，而非固定且可被預先植入的路徑。
 - **CI**：發行工作流程預設 `contents: read`，僅發行工作授予 `contents: write`，且 checkout 不保存憑證。建議將第三方 Actions 釘選至完整 commit SHA。
 

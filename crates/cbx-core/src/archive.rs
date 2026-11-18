@@ -1191,108 +1191,91 @@ fn find_cover_tar<R: Read + Seek>(
     opt: &CoverOptions,
     exclude: &[String],
 ) -> Result<CoverCandidate, String> {
+    // Pass 1: walk the 512-byte headers with `entries_with_seek`, which seeks over entry data
+    // instead of reading it, and remember where each candidate's data starts.
+    // Pass 2: seek to the chosen entry and read only its bytes.
     reader.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
-    let mut ar = tar::Archive::new(reader);
     let deadline = Instant::now() + opt.scan_timeout;
 
-    let mut best_name = String::new();
-    let mut best_data = Vec::new();
     let mut has_risk = false;
-    let mut tar_image_entries: Vec<(usize, String)> = Vec::new();
-
-    let entries = ar.entries().map_err(|e| e.to_string())?;
-    for (idx, entry_res) in entries.take(MAX_SCAN_ENTRIES).enumerate() {
-        if (idx & 0x3F) == 0 && Instant::now() > deadline {
-            break;
-        }
-        let Ok(entry) = entry_res else {
-            break;
-        };
-        let raw_path = entry
-            .path()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let size = entry.size();
-        if inspect_entry_security_with_rules(&raw_path, size, size, false, Some(&opt.risk_rules)).is_some() {
-            has_risk = true;
-        }
-        if !entry.header().entry_type().is_file() {
-            continue;
-        }
-        if size == 0 || size > opt.max_image_bytes {
-            continue;
-        }
-        let Some(name) = sanitize_archive_path(&raw_path) else {
-            continue;
-        };
-        if is_junk_name(&name) || !is_image_name(&name) {
-            continue;
-        }
-        if exclude.iter().any(|ex| ex == &name) {
-            continue;
-        }
-        tar_image_entries.push((tar_image_entries.len(), name.clone()));
-        let better = best_name.is_empty() || (opt.sort && natural_cmp_less(&name, &best_name));
-        if !better {
-            continue;
-        }
-        if let Ok(data) = read_bounded_with_deadline(entry, opt.max_image_bytes, deadline) {
-            best_name = name;
-            best_data = data;
-            if !opt.sort {
+    // (name, data position, size); the ordinal doubles as the `pick_best_cover_index` key.
+    let mut candidates: Vec<(String, u64, u64)> = Vec::new();
+    let mut image_entries: Vec<(usize, String)> = Vec::new();
+    let mut best: Option<usize> = None;
+    {
+        let mut ar = tar::Archive::new(&mut *reader);
+        let entries = ar.entries_with_seek().map_err(|e| e.to_string())?;
+        for (idx, entry_res) in entries.take(MAX_SCAN_ENTRIES).enumerate() {
+            if (idx & 0x3F) == 0 && Instant::now() > deadline {
                 break;
             }
-        }
-    }
-
-    if opt.sort && opt.prefer_continuous_sequence && tar_image_entries.len() > 1 {
-        if let Some(chosen_ord) = pick_best_cover_index(&tar_image_entries, opt.sort, true) {
-            let chosen_name = tar_image_entries[chosen_ord].1.clone();
-            if chosen_name != best_name && Instant::now() < deadline {
-                let reader_ref = ar.into_inner();
-                if reader_ref.seek(SeekFrom::Start(0)).is_ok() {
-                    let mut ar2 = tar::Archive::new(reader_ref);
-                    if let Ok(entries2) = ar2.entries() {
-                        for (idx2, entry_res2) in entries2.take(MAX_SCAN_ENTRIES).enumerate() {
-                            if (idx2 & 0x3F) == 0 && Instant::now() > deadline {
-                                break;
-                            }
-                            let Ok(entry2) = entry_res2 else { break; };
-                            if !entry2.header().entry_type().is_file() {
-                                continue;
-                            }
-                            let raw_path2 = entry2
-                                .path()
-                                .map(|p| p.to_string_lossy().into_owned())
-                                .unwrap_or_default();
-                            if let Some(name2) = sanitize_archive_path(&raw_path2) {
-                                if name2 == chosen_name {
-                                    if let Ok(data2) = read_bounded_with_deadline(entry2, opt.max_image_bytes, deadline) {
-                                        best_name = name2;
-                                        best_data = data2;
-                                    }
-                                    break;
-                                }
-                            }
-                        }
-                    }
+            let Ok(entry) = entry_res else {
+                break;
+            };
+            let raw_path = entry
+                .path()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let size = entry.size();
+            if inspect_entry_security_with_rules(&raw_path, size, size, false, Some(&opt.risk_rules)).is_some() {
+                has_risk = true;
+            }
+            // Regular files only: sparse / continuation entries do not store contiguous data.
+            if !entry.header().entry_type().is_file() {
+                continue;
+            }
+            if size == 0 || size > opt.max_image_bytes {
+                continue;
+            }
+            let Some(name) = sanitize_archive_path(&raw_path) else {
+                continue;
+            };
+            if is_junk_name(&name) || !is_image_name(&name) {
+                continue;
+            }
+            if exclude.iter().any(|ex| ex == &name) {
+                continue;
+            }
+            let ord = candidates.len();
+            let better = match best {
+                None => true,
+                Some(b) => opt.sort && natural_cmp_less(&name, &candidates[b].0),
+            };
+            candidates.push((name.clone(), entry.raw_file_position(), size));
+            image_entries.push((ord, name));
+            if better {
+                best = Some(ord);
+                if !opt.sort {
+                    break;
                 }
             }
         }
     }
 
-    if best_name.is_empty() {
-        Err("No cover image candidate found in TAR archive".into())
-    } else {
-        Ok(CoverCandidate {
-            name: best_name,
-            data: best_data,
-            from_epub_metadata: false,
-            is_epub: false,
-            container: ContainerFormat::Tar,
-            has_risk: opt.anomaly_detection && has_risk,
-        })
+    if opt.sort && opt.prefer_continuous_sequence && image_entries.len() > 1 {
+        if let Some(chosen_ord) = pick_best_cover_index(&image_entries, opt.sort, true) {
+            if chosen_ord < candidates.len() {
+                best = Some(chosen_ord);
+            }
+        }
     }
+    let Some(b) = best else {
+        return Err("No cover image candidate found in TAR archive".into());
+    };
+    let (best_name, pos, size) = candidates.swap_remove(b);
+    reader.seek(SeekFrom::Start(pos)).map_err(|e| e.to_string())?;
+    let best_data = read_bounded_with_deadline((&mut *reader).take(size), opt.max_image_bytes, deadline)?;
+    if best_data.len() as u64 != size {
+        return Err("TAR entry data truncated".into());
+    }
+    Ok(CoverCandidate {
+        name: best_name,
+        data: best_data,
+        from_epub_metadata: false,
+        is_epub: false,
+        container: ContainerFormat::Tar,
+        has_risk: opt.anomaly_detection && has_risk,
+    })
 }
 
 fn count_entries_tar<R: Read + Seek>(
@@ -1309,7 +1292,8 @@ fn count_entries_tar<R: Read + Seek>(
         has_risk: false,
         risk_reasons: Vec::new(),
     };
-    let entries = ar.entries().map_err(|e| e.to_string())?;
+    // Header-only walk: entry data is skipped with seeks, not read.
+    let entries = ar.entries_with_seek().map_err(|e| e.to_string())?;
     for (idx, entry_res) in entries.enumerate() {
         if idx >= MAX_SCAN_ENTRIES || Instant::now() > deadline {
             stats.complete = false;

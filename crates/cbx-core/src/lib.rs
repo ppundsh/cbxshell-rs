@@ -11,7 +11,9 @@ pub mod other_doc;
 pub mod redact;
 pub mod monitor;
 pub mod rar_pure;
+pub(crate) mod rar_walk;
 pub mod registry;
+pub mod prewarm;
 pub mod settings;
 
 #[cfg(test)]
@@ -599,6 +601,31 @@ pub fn create_universal_thumbnail(
     settings: &Settings,
     ext_hint: Option<&str>,
 ) -> Result<HBITMAP, String> {
+    create_universal_thumbnail_impl(stream, cx, settings, ext_hint, true)
+}
+
+/// Like [`create_universal_thumbnail`], but a video that cannot be decoded from the stream is
+/// reported as an error instead of being replaced by the "corrupt video" placeholder card.
+///
+/// The shell extension uses this for stream-only requests (network / UNC shares, where the file
+/// cannot be opened directly): a placeholder returned there is cached by Explorer and keeps
+/// covering the real thumbnail that a later request produces successfully.
+pub fn create_universal_thumbnail_no_placeholder(
+    stream: &IStream,
+    cx: u32,
+    settings: &Settings,
+    ext_hint: Option<&str>,
+) -> Result<HBITMAP, String> {
+    create_universal_thumbnail_impl(stream, cx, settings, ext_hint, false)
+}
+
+fn create_universal_thumbnail_impl(
+    stream: &IStream,
+    cx: u32,
+    settings: &Settings,
+    ext_hint: Option<&str>,
+    placeholder_on_video_error: bool,
+) -> Result<HBITMAP, String> {
     let mut ext = extract_normalized_ext(ext_hint);
 
     if ext.is_empty() {
@@ -615,7 +642,7 @@ pub fn create_universal_thumbnail(
             let p = Path::new(path_str);
             // Only trust an absolute, local, non-device path; a bare stream name must never be
             // resolved against the host process's current directory (confused-deputy read).
-            if media::is_trusted_local_abs_path(p) && p.is_file() {
+            if media::is_openable_media_path(p) && p.is_file() {
                 media::video_mf::extract_video_thumbnail_from_path(p, cx, &settings.smart_render_config())
             } else {
                 media::video_mf::extract_video_thumbnail_from_stream(stream, cx, &settings.smart_render_config())
@@ -630,6 +657,7 @@ pub fn create_universal_thumbnail(
                 let bgra = rgba_to_bgra(&rgba);
                 create_hbitmap_from_bgra(rgba.width(), rgba.height(), &bgra)
             }
+            Err(e) if !placeholder_on_video_error => Err(e),
             Err(_) => {
                 // Windows 11 Explorer Fast Recovery:
                 // When video decoding fails (e.g. a truncated or corrupted container),

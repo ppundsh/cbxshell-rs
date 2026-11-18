@@ -6,9 +6,9 @@
   "nav.about": "About",
   "nav.status_ready": "System Ready",
   "nav.switch_lang": "English",
-  "sidebar.status_ready": "2.0.0 • 🟢 System Ready",
-  "sidebar.status_processing": "2.0.0 • 🔵 Processing",
-  "sidebar.status_processing_warn": "2.0.0 • ⚠️ Processing",
+  "sidebar.status_ready": "🟢 System Ready",
+  "sidebar.status_processing": "🔵 Processing",
+  "sidebar.status_processing_warn": "⚠️ Processing",
 
   "cache.title": "System Repair & Cache Management",
   "cache.clear_btn": "Clear Cache",
@@ -136,5 +136,19 @@
 
   "error.ffmpeg_missing": "FFmpeg was not detected. To support formats such as 10-bit H.264, install FFmpeg via the installer or add FFmpeg to your PATH environment variable.",
   "error.target_not_found": "Target file does not exist",
-  "error.sh_create_item_failed": "SHCreateItemFromParsingName failed: {err}"
+  "error.sh_create_item_failed": "SHCreateItemFromParsingName failed: {err}",
+  "error.ext_not_associated": "{ext} is not associated with CBX Shell, so Explorer will not use it for thumbnails; enable and apply it on its page first",
+  "error.thumbnail_extract_failed": "Thumbnail re-extraction failed: {err}",
+  "trace.network_policy_off": "Found a network location, but \"Allow reading network shares\" is off; using the stream",
+  "trace.network_not_lan": "Server {server} does not pass \"Local network only\"; using the stream",
+  "trace.everything_unavailable": "Everything is not running or unreachable; using the stream",
+  "trace.everything_no_hit": "Everything found no file with this name (is the location indexed?); using the stream",
+  "trace.everything_rejected": "Everything: {count} hit(s) unusable: {reason}",
+  "reject.path_form": "path form not allowed: {path}",
+  "reject.name_mismatch": "name mismatch: {path}",
+  "reject.not_local": "not a local drive: {path}",
+  "reject.not_file": "{err}: {path}",
+  "reject.host_unreachable": "server {server} unreachable (Everything may have indexed an old address)",
+  "reject.size": "size mismatch for {path}: stream {expected} bytes, file {actual} bytes",
+  "trace.no_stream_size": "The stream reports no file size, so the real file cannot be matched; using the stream"
 }

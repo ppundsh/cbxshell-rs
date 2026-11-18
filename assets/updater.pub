@@ -1,0 +1,11 @@
+# CBX Shell update signing key (minisign / Tauri signer public key).
+#
+# Paste the public key here — any of these forms works:
+#   * the whole minisign .pub file ("untrusted comment: ..." + the RW... line)
+#   * the base64 string printed by `npx @tauri-apps/cli signer generate`
+#   * just the RW... key line
+#
+# While this file has no key, the manager shows "no update signing key" and never
+# downloads or runs anything. See doc/updates.md.
+
+dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEI1NTE3NUY2MDk1OTkwNjYKUldSbWtGa0o5blZSdFVtYkxEYVdZeGFTZWxEQlpvRDVMU1FWajlkTXAzakpvRS8yeExzRmx3L1QK
